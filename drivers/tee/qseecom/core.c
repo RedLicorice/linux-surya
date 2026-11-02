@@ -1410,6 +1410,11 @@ static void qseecom_tee_supp_release(struct tee_context *ctx)
  * chooses which signed image, and TZ has no notion of which one the kernel
  * meant to run.
  *
+ * An application ships either split, as <name>.mdt and its .bNN segments, or
+ * as a single signed ELF, <name>.mbn. The split form is tried first. A single
+ * image is handed to TZ as it is stored, with an mdt length of zero, and TZ
+ * reads the metadata from it itself.
+ *
  * qcom_mdt_load() cannot be used as-is, despite handling the same file format.
  * It solves the remoteproc problem: scatter each segment to its p_paddr inside
  * a carveout. QSEECOM's APP_START instead takes one contiguous buffer -- the
@@ -1448,8 +1453,9 @@ static int qseecom_tee_supp_load_app(struct tee_context *ctx,
 	char app_name[QSEECOM_TEE_MAX_APP_NAME];
 	size_t img_len, mdt_len, stage_len;
 	phys_addr_t stage_phys, img_phys;
-	const struct firmware *mdt;
+	const struct firmware *fw;
 	void *stage, *aligned;
+	bool split;
 	ssize_t len;
 	struct qcom_tzmem_pool *pool;
 	u32 app_id;
@@ -1463,15 +1469,25 @@ static int qseecom_tee_supp_load_app(struct tee_context *ctx,
 		return ret;
 
 	snprintf(fw_name, sizeof(fw_name), "%s.mdt", app_name);
-
-	ret = request_firmware(&mdt, fw_name, qtee->dev);
+	ret = firmware_request_nowarn(&fw, fw_name, qtee->dev);
+	split = !ret;
+	if (ret == -ENOENT) {
+		snprintf(fw_name, sizeof(fw_name), "%s.mbn", app_name);
+		ret = request_firmware(&fw, fw_name, qtee->dev);
+	}
 	if (ret)
 		return ret;
 
-	len = qcom_mdt_get_image_size(mdt);
-	if (len < 0) {
-		ret = len;
-		goto out_release;
+	if (split) {
+		len = qcom_mdt_get_image_size(fw);
+		if (len < 0) {
+			ret = len;
+			goto out_release;
+		}
+		mdt_len = fw->size;
+	} else {
+		len = fw->size;
+		mdt_len = 0;
 	}
 
 	if (len > QSEECOM_TEE_MAX_IMAGE) {
@@ -1480,7 +1496,6 @@ static int qseecom_tee_supp_load_app(struct tee_context *ctx,
 	}
 
 	img_len = len;
-	mdt_len = mdt->size;
 
 	/*
 	 * Stage the image through a pool of its own rather than the shared one.
@@ -1518,7 +1533,14 @@ static int qseecom_tee_supp_load_app(struct tee_context *ctx,
 	img_phys = ALIGN(stage_phys, QSEECOM_TEE_IMAGE_ALIGN);
 	aligned = stage + (img_phys - stage_phys);
 
-	len = qcom_mdt_read_image(qtee->dev, mdt, fw_name, aligned, img_len);
+	if (split) {
+		len = qcom_mdt_read_image(qtee->dev, fw, fw_name, aligned,
+					  img_len);
+	} else {
+		memcpy(aligned, fw->data, img_len);
+		len = img_len;
+	}
+
 	if (len < 0)
 		ret = len;
 	else
@@ -1527,7 +1549,7 @@ static int qseecom_tee_supp_load_app(struct tee_context *ctx,
 
 	qcom_tzmem_free(stage);
 	qcom_tzmem_pool_free(pool);
-	release_firmware(mdt);
+	release_firmware(fw);
 
 	if (ret) {
 		dev_warn(qtee->dev, "failed to load '%s': %d\n", app_name, ret);
@@ -1563,7 +1585,7 @@ static int qseecom_tee_supp_load_app(struct tee_context *ctx,
 	return 0;
 
 out_release:
-	release_firmware(mdt);
+	release_firmware(fw);
 	return ret;
 
 err_shutdown:

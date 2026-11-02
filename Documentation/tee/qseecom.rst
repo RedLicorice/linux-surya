@@ -132,10 +132,18 @@ Loading applications
 
 A load session is opened on the privileged device with a single MEMREF_INPUT
 holding the application name. The image is *not* passed in: the driver fetches
-``<name>.mdt`` and its ``.bNN`` segments with ``request_firmware()`` and
-assembles them itself, so what can be loaded is whatever the firmware search
-path holds rather than whatever bytes a process assembles. This is the same
-contract amdtee uses.
+it with ``request_firmware()`` itself, so what can be loaded is whatever the
+firmware search path holds rather than whatever bytes a process assembles. This
+is the same contract amdtee uses.
+
+An application ships in one of two forms, and the driver tries them in this
+order:
+
+- split, as ``<name>.mdt`` and its ``.bNN`` segments, which the driver
+  assembles as described below;
+- a single signed ELF, ``<name>.mbn``, which the driver hands to QSEE as it is
+  stored, with an ``.mdt`` length of zero, so that QSEE reads the metadata from
+  the image itself.
 
 The name is therefore part of a firmware path and is validated as one: it must
 be non-empty, must fit ``QSEECOM_TEE_MAX_APP_NAME``, and must not contain ``/``
