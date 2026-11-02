@@ -2503,18 +2503,23 @@ int qcom_scm_qseecom_app_get_id(const char *app_name, u32 *app_id)
 EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_get_id);
 
 /**
- * qcom_scm_qseecom_app_load() - Load a QSEE app from an assembled image.
+ * qcom_scm_qseecom_app_load() - Load a QSEE app from an image.
  * @img:      Image buffer (must be TZ memory).
- * @mdt_len:  Length of the .mdt metadata at the start of @img.
- * @img_len:  Total length of the assembled image.
+ * @mdt_len:  Length of the .mdt metadata at the start of @img, or zero for a
+ *            single-file image.
+ * @img_len:  Total length of the image.
  * @app_id:   Out: ID of the newly loaded app.
  *
- * Hands a signed, split-ELF application image to QTEE for authentication and
- * loading. @img must hold the .mdt metadata followed by each segment file
- * concatenated in program-header order, and must be allocated from a TZ
- * memory pool. Note this is not the original unsplit file: the metadata
- * segments appear twice, since the .mdt already contains them, and any
- * padding between segments is dropped.
+ * Hands a signed application image to QTEE for authentication and loading.
+ * @img must be allocated from a TZ memory pool and holds one of two layouts:
+ *
+ * - A split image, with a non-zero @mdt_len: the .mdt metadata followed by
+ *   each segment file concatenated in program-header order. Note this is not
+ *   the original unsplit file: the metadata segments appear twice, since the
+ *   .mdt already contains them, and any padding between segments is dropped.
+ *
+ * - A single-file image (.mbn), with @mdt_len zero: the signed ELF as it is
+ *   stored, from which QTEE reads the metadata itself.
  *
  * A 32-bit application additionally requires the cmnlib shared library to
  * have been loaded first, with the load-service-image command.
@@ -2533,7 +2538,7 @@ int qcom_scm_qseecom_app_load(void *img, size_t mdt_len, size_t img_len,
 	phys_addr_t img_phys;
 	int status;
 
-	if (!img || !mdt_len || mdt_len > img_len)
+	if (!img || !img_len || mdt_len > img_len)
 		return -EINVAL;
 
 	desc.owner = QSEECOM_TZ_OWNER_QSEE_OS;
