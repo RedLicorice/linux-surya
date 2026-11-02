@@ -2172,8 +2172,8 @@ static int qcom_scm_qseecom_service_listeners(struct qcom_scm_qseecom_resp *res)
 	struct qcom_scm_qseecom_listener *listener;
 	unsigned int rounds = 0;
 	u32 status;
-	u32 id;
 	int ret;
+	u32 id;
 
 	lockdep_assert_held(&qcom_scm_qseecom_call_lock);
 
@@ -2525,9 +2525,9 @@ EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_get_id);
 int qcom_scm_qseecom_app_load(void *img, size_t mdt_len, size_t img_len,
 			      u32 *app_id)
 {
-	phys_addr_t img_phys;
 	struct qcom_scm_qseecom_resp res = {};
 	struct qcom_scm_desc desc = {};
+	phys_addr_t img_phys;
 	int status;
 
 	if (!img || !mdt_len || mdt_len > img_len)
