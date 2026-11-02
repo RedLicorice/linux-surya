@@ -135,6 +135,9 @@ enum qcom_scm_qseecom_tz_cmd_info {
 	QSEECOM_TZ_CMD_INFO_VERSION		= 3,
 };
 
+/* QSEE versions from TZ.BF.4.0 on take addresses at full width. */
+#define QSEECOM_VERSION_4_0			0x1000000
+
 #define RSCTABLE_BUFFER_NOT_SUFFICIENT		20
 
 #define QSEECOM_MAX_APP_NAME_SIZE		64
@@ -2755,6 +2758,20 @@ static int qcom_scm_qseecom_init(struct qcom_scm *scm)
 		return 0;
 
 	dev_info(scm->dev, "qseecom: found qseecom with version 0x%x\n", version);
+
+	/*
+	 * QSEE older than TZ.BF.4.0 takes the address of an application image
+	 * or a listener shared buffer in a 32-bit field, so TZ memory has to
+	 * come from below 4 GiB.
+	 */
+	if (version < QSEECOM_VERSION_4_0) {
+		ret = dma_set_coherent_mask(scm->dev, DMA_BIT_MASK(32));
+		if (ret) {
+			dev_err(scm->dev, "qseecom: cannot limit TZ memory to 32 bits: %d\n",
+				ret);
+			return 0;
+		}
+	}
 
 	/*
 	 * Set up the TEE interface device, which is what lets user space reach
