@@ -234,6 +234,7 @@ struct smb_init_register {
  * @status_change_work: Worker to handle plug/unplug events
  * @cable_irq:		USB plugin IRQ
  * @wakeup_enabled:	If the cable IRQ will cause a wakeup
+ * @notified_icl_ua:	The input current limit last reported by an ICL change
  * @usb_in_i_chan:	USB_IN current measurement channel
  * @usb_in_v_chan:	USB_IN voltage measurement channel
  * @chg_psy:		Charger power supply instance
@@ -251,6 +252,7 @@ struct smb_chip {
 	struct delayed_work status_change_work;
 	int cable_irq;
 	bool wakeup_enabled;
+	unsigned int notified_icl_ua;
 
 	struct iio_channel *usb_in_i_chan;
 	struct iio_channel *usb_in_v_chan;
@@ -763,11 +765,26 @@ static irqreturn_t smb_handle_usb_plugin(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/*
+ * AICL reruns every few seconds (AICL_RERUN_TIME_CFG), and on a port that cannot supply the programmed limit it
+ * walks the limit up and down at every rerun: about three ICL changes a second on a PC's USB port. Each
+ * power_supply_changed() holds the supply's wakeup source, and a wakeup event aborts any system sleep in
+ * progress (with wakeup_count in use), so a phone on such a port never slept. Report a change only when the
+ * settled limit moved by a real amount, or input current started or stopped.
+ */
+#define ICL_NOTIFY_DELTA_UA	200000
+
 static irqreturn_t smb_handle_usb_icl_change(int irq, void *data)
 {
 	struct smb_chip *chip = data;
+	unsigned int icl;
 
-	power_supply_changed(chip->chg_psy);
+	if (smb_get_current_limit(chip, &icl) < 0 ||
+	    (icl == 0) != (chip->notified_icl_ua == 0) ||
+	    abs((int)icl - (int)chip->notified_icl_ua) >= ICL_NOTIFY_DELTA_UA) {
+		chip->notified_icl_ua = icl;
+		power_supply_changed(chip->chg_psy);
+	}
 
 	return IRQ_HANDLED;
 }

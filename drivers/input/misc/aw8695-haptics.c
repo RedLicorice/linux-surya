@@ -11,7 +11,9 @@
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/input.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
@@ -339,6 +341,7 @@
 /* AW8624 RAM playback gain: 0x80 plays the waveform at full scale */
 #define AW8624_DATDBG				0x3b
 #define AW8624_GAIN_FULL			0x80
+#define AW8624_MIN_ON_MS			15	/* three cycles at 205 Hz */
 
 #define AW8695_BST_AUTO				0x47
 #define AW8695_BST_AUTO_BST_AUTOSW_MASK		GENMASK(2, 2)
@@ -508,6 +511,17 @@ struct aw8695_data {
 	bool running;
 	u16 level;
 	struct work_struct play_work;
+	/*
+	 * The motor's own on time (see aw8695_haptics_play_work): when the
+	 * play and the stop were asked for, when GO really started it, and the
+	 * stop held back until it has run that long.
+	 */
+	struct mutex lock;
+	struct delayed_work stop_work;
+	ktime_t asked_at;
+	ktime_t stop_asked_at;
+	ktime_t on_at;
+	bool on;
 	/* Parameters from devicetree */
 	u32 f0_preset;
 	u32 f0_coefficient;
@@ -697,6 +711,10 @@ static int aw8695_haptics_play(struct input_dev *dev, void *data,
 	if (!level)
 		level = effect->u.rumble.weak_magnitude;
 
+	if (level && !haptics->running)
+		haptics->asked_at = ktime_get();
+	else if (!level && haptics->running)
+		haptics->stop_asked_at = ktime_get();
 	haptics->running = level;
 	haptics->level = level;
 	schedule_work(&haptics->play_work);
@@ -784,6 +802,8 @@ static void aw8695_close(struct input_dev *input)
 	int err;
 
 	cancel_work_sync(&haptics->play_work);
+	cancel_delayed_work_sync(&haptics->stop_work);
+	haptics->on = false;
 	err = aw8695_haptics_stop(haptics);
 	if (err)
 		dev_err(dev, "Failed to stop haptics: %d\n", err);
@@ -796,13 +816,61 @@ static void aw8695_haptics_play_work(struct work_struct *work)
 	struct device *dev = &haptics->client->dev;
 	int err;
 
-	if (haptics->running)
+	mutex_lock(&haptics->lock);
+	if (haptics->running) {
+		cancel_delayed_work(&haptics->stop_work);
 		err = aw8695_haptics_start(haptics);
-	else
+		if (!err) {
+			haptics->on = true;
+			haptics->on_at = ktime_get();
+		}
+	} else if (haptics->on) {
+		/*
+		 * The start is some 8 ms of I2C before GO, and ff-memless times
+		 * the stop from the request: a 5 ms effect drove the motor for
+		 * under 1 ms, a 12 ms one for 4 ms, too short for the LRA to be
+		 * felt (measured on the AW8624, 2026-11-12). So the motor runs
+		 * as long as it was asked to from when GO really started it,
+		 * and the AW8624 for at least AW8624_MIN_ON_MS: a few cycles at
+		 * its 205 Hz, what a tick needs without the overdrive of
+		 * Android's RAM effects.
+		 */
+		s64 asked = ktime_ms_delta(haptics->stop_asked_at, haptics->asked_at);
+		s64 ran = ktime_ms_delta(ktime_get(), haptics->on_at);
+		s64 want = max_t(s64, asked, haptics->aw8624 ? AW8624_MIN_ON_MS : 0);
+
+		if (ran < want) {
+			mod_delayed_work(system_wq, &haptics->stop_work,
+					 msecs_to_jiffies(want - ran));
+			mutex_unlock(&haptics->lock);
+			return;
+		}
 		err = aw8695_haptics_stop(haptics);
+		haptics->on = false;
+	} else {
+		err = aw8695_haptics_stop(haptics);
+	}
+	mutex_unlock(&haptics->lock);
 
 	if (err)
 		dev_err(dev, "Failed to execute work command: %d\n", err);
+}
+
+static void aw8695_haptics_stop_work(struct work_struct *work)
+{
+	struct aw8695_data *haptics =
+		container_of(to_delayed_work(work), struct aw8695_data, stop_work);
+	int err = 0;
+
+	mutex_lock(&haptics->lock);
+	if (!haptics->running && haptics->on) {
+		err = aw8695_haptics_stop(haptics);
+		haptics->on = false;
+	}
+	mutex_unlock(&haptics->lock);
+
+	if (err)
+		dev_err(&haptics->client->dev, "Failed to stop: %d\n", err);
 }
 
 static void aw8695_hw_reset(struct aw8695_data *haptics)
@@ -1406,6 +1474,10 @@ static int aw8695_probe(struct i2c_client *client)
 		return dev_err_probe(dev, err, "Failed to request interrupt\n");
 
 	INIT_WORK(&haptics->play_work, aw8695_haptics_play_work);
+	INIT_DELAYED_WORK(&haptics->stop_work, aw8695_haptics_stop_work);
+	err = devm_mutex_init(dev, &haptics->lock);
+	if (err)
+		return err;
 
 	haptics->input_dev->name = "aw8695-haptics";
 	haptics->input_dev->close = aw8695_close;

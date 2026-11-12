@@ -16,6 +16,16 @@ Use the `main` branch; the kernel release is `7.2.15-surya` (`LOCALVERSION=-sury
 New in this version
 ===================
 
+* **The phone sleeps on a computer's USB port.** The charger reported an input-limit change about three
+  times a second there, and each report woke the phone out of a sleep. It now reports only a real change.
+  See Suspend.
+* **Short vibrations are felt.** A short effect drove the motor for a fraction of the time it asked for: a
+  5 ms tick for under 1 ms. The motor now runs as long as it was asked to, and at least 15 ms. See
+  Vibration.
+
+The previous update (Linux 7.2.15, hardware video, 60 fps cameras, a cleaner boot picture) is commit
+cb6904117b9d:
+
 * **Linux 7.2.15.** 7.2.11 to 7.2.15 come from kernel.org's stable patches; none of them touches the
   surya changes below.
 * **Hardware video decode and encode** (Venus, IRIS1): H.264, HEVC, VP8 and VP9 decode, H.264 and HEVC
@@ -26,8 +36,8 @@ New in this version
 * **A cleaner boot picture**: the hand-over from the boot logo to the boot splash no longer flashes white
   or goes black. See Touchscreen and display.
 * **The top microphone works**: it had no SoundWire port of its own. See Audio.
-* **Sleep:** suspend to idle works with the image's sleep daemon; the kernel has no surya-specific sleep
-  changes yet. What it takes and what is still open is under Suspend.
+* **Sleep:** suspend to idle works with the image's sleep daemon. What it takes and what is still open is
+  under Suspend.
 
 Changes for the POCO X3 NFC
 ===========================
@@ -118,8 +128,8 @@ Suspend
 -------
 
 Suspend to idle works with this kernel as it is; the image's sleep daemon (`surya-sleepd`) puts the phone
-to sleep when the screen goes off. There are no surya-specific sleep changes in this tree yet. What a sleep
-needs, and what is still open:
+to sleep when the screen goes off. The one surya-specific sleep change in this tree is the charger's (below).
+What a sleep needs, and what is still open:
 
 * **The FastRPC servers have to be stopped before a sleep** (both hexagonrpcd instances, not only the
   sensors' one). Frozen through a sleep, they crash the ADSP at resume, and after its restart the VA macro
@@ -127,9 +137,11 @@ needs, and what is still open:
 * **The Bluetooth UART's RX wake ends every sleep after about a second** (its wake IRQ fires as soon as it
   is armed). With `power/wakeup` of `88c000.serial` set to `disabled` the phone sleeps until something
   real wakes it. The kernel fix is open.
-* **On a computer's USB port the charger reports an input-limit change about three times a second** (AICL
-  hunting), and each report is a wakeup event that aborts a sleep. A `qcom_smbx` change that reports only
-  real changes is written, not in this tree.
+* **Fixed: on a computer's USB port the phone never slept.** AICL reruns every few seconds, and on a port
+  that cannot supply the programmed limit it walks the limit up and down at every rerun: about three
+  input-limit changes a second. `qcom_smbx` reported each one with `power_supply_changed()`, which holds the
+  supply's wakeup source, and a wakeup event aborts a sleep in progress. It now reports a change only when
+  the limit moved by 200 mA or more, or input current started or stopped.
 * Wi-Fi disconnects at every suspend and is back about 4 s after the resume.
 
 Vibration: AW8624 haptics
@@ -145,6 +157,11 @@ Vibration: AW8624 haptics
 * **Strength.** The rumble magnitude sets the AW8624's RAM playback gain (`DATDBG`, 0x3b), so
   softer effects play softer, and feedbackd's `max-haptic-strength` setting controls how strongly
   the phone vibrates.
+* **Short effects run their full length.** Starting an effect is some 8 ms of I2C before the GO bit, and
+  ff-memless times the stop from the request, so a 5 ms effect drove the motor for under 1 ms and a 12 ms
+  one for 4 ms (measured), too short to feel. The stop is now timed from when GO started the motor: it runs
+  for as long as the effect asked, and the AW8624 for at least 15 ms (three cycles at 205 Hz), what a key
+  tick needs. 15 ms may still be tuned by feel.
 * Pulses closer than about 150 ms apart blur together: the motor keeps ringing for that long after
   each pulse.
 
