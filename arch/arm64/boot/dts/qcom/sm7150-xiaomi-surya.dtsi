@@ -6,6 +6,7 @@
 
 /dts-v1/;
 
+#include <dt-bindings/firmware/qcom,scm.h>
 #include <dt-bindings/media/video-interfaces.h>
 #include <dt-bindings/sound/qcom,q6voice.h>
 #include "sm7150-xiaomi-common.dtsi"
@@ -963,6 +964,70 @@
 
 &venus {
 	firmware-name = "qcom/sm7150/xiaomi/surya/venus.mbn";
+
+	/* the Venus driver's IRIS1 roles for downstream's sdmmagpie clocks (see sm7150_res) */
+	clocks = <&videocc VIDEOCC_MVSC_CTL_AXI_CLK>,
+		 <&videocc VIDEOCC_MVS0_AXI_CLK>,
+		 <&videocc VIDEOCC_MVS1_AXI_CLK>,
+		 <&videocc VIDEOCC_MVSC_CORE_CLK>,
+		 <&videocc VIDEOCC_MVS0_CORE_CLK>,
+		 <&videocc VIDEOCC_MVS1_CORE_CLK>,
+		 <&videocc VIDEOCC_VENUS_AHB_CLK>;
+	clock-names = "iface", "vcodec0_bus", "cvp_bus", "core",
+		      "vcodec0_core", "cvp_core", "bus";
+	power-domain-names = "venus", "vcodec0", "cvp", "cx";
+
+	/*
+	 * Downstream's IOVA layout (sdmmagpie-vidc.dtsi): normal buffers above the protected window
+	 * (venus_ns from 0x25800000), and the secure non-pixel stream for the one buffer the IRIS1
+	 * encoder firmware wants there (its INTERNAL_PERSIST), at 0x01000000..0x25800000.
+	 */
+	memory-region = <&venus_mem>, <&venus_iova>;
+	memory-region-names = "firmware", "iova";
+	/*
+	 * No dma-ranges here (the SM8150 port has one): arm64 sizes ZONE_DMA from the smallest dma-ranges in the
+	 * whole tree, and 0x25800000 left no ZONE_DMA at all on this phone (RAM starts at 0x80000000), so every
+	 * GFP_DMA allocation failed - the touchscreen's firmware buffer first. The driver limits the secure
+	 * non-pixel device's IOVAs itself (venus_get_secure_nonpixel_device()).
+	 */
+	#address-cells = <2>;
+	#size-cells = <2>;
+	ranges;
+	status = "okay";
+
+	venus_secure_nonpixel: secure-non-pixel {
+		compatible = "qcom,venus-secure-context";
+		iommus = <&apps_smmu 0x1084 0x60>;
+		/* its page tables go to this VM too, or the SMMU cannot walk them (arm-smmu-qcom) */
+		qcom,secure-vmid = <QCOM_SCM_VMID_CP_NON_PIXEL>;
+		memory-region = <&venus_secure_nonpixel_iova>;
+	};
+};
+
+/ {
+	reserved-memory {
+		venus_iova: venus-iova {
+			iommu-addresses = <&venus 0 0 0 0x25800000>;
+		};
+
+		venus_secure_nonpixel_iova: venus-secure-nonpixel-iova {
+			iommu-addresses = <&venus_secure_nonpixel 0 0 0 0x1000000>;
+		};
+	};
+};
+
+/* multipipe fused off on this phone: the video clocks run at 192 MHz only (see videocc-sm7150.c) */
+&venus_opp_table {
+	/delete-node/ opp-240000000;
+	/delete-node/ opp-338000000;
+	/delete-node/ opp-365000000;
+	/delete-node/ opp-444000000;
+	/delete-node/ opp-533000000;
+
+	opp-192000000 {
+		opp-hz = /bits/ 64 <192000000>;
+		required-opps = <&rpmhpd_opp_low_svs>;
+	};
 };
 
 &vreg_l18a_2p8 {

@@ -39,6 +39,19 @@
 
 #define MAX_RETRY		10
 
+/*
+ * Smart Actuator Control: the chip drives the coil in a damped profile instead of a step, so the lens settles in a
+ * few ms rather than ringing for half a second (a contrast autofocus reads that ringing as blur). The mode and the
+ * resonance timing belong to the lens module, so they come from the board (Xiaomi's POCO X3 NFC IMX682 module,
+ * "sunny_dw9800": mode 0x40 (SAC3), timing 0x7a, ringing control on). -1: left as the chip starts (direct mode).
+ */
+static int sac_mode = -1;
+module_param(sac_mode, int, 0644);
+MODULE_PARM_DESC(sac_mode, "SAC mode register (0x06) value, -1 to leave the chip in direct mode");
+static int sac_timing = -1;
+module_param(sac_timing, int, 0644);
+MODULE_PARM_DESC(sac_timing, "SAC resonance timing register (0x07) value, used with sac_mode");
+
 struct dw9807_device {
 	struct v4l2_ctrl_handler ctrls_vcm;
 	struct v4l2_subdev sd;
@@ -133,6 +146,17 @@ static int dw9807_set_ctrl(struct v4l2_ctrl *ctrl)
 			if (i2c_master_send(client, on, sizeof(on)) < 0)
 				return 0;	/* still unreachable: keep the value for later */
 			dev_vcm->online = true;
+			if (sac_mode >= 0 && sac_timing >= 0) {
+				const char ring[2] = { DW9807_CTL_ADDR, 0x02 };
+				const char mode[2] = { DW9807_MODE_ADDR, sac_mode & 0xff };
+				const char timing[2] = { DW9807_RESONANCE_ADDR, sac_timing & 0xff };
+
+				usleep_range(1000, 1100);	/* out of power-down */
+				if (i2c_master_send(client, ring, sizeof(ring)) < 0 ||
+				    i2c_master_send(client, mode, sizeof(mode)) < 0 ||
+				    i2c_master_send(client, timing, sizeof(timing)) < 0)
+					dev_warn(&client->dev, "SAC setup failed\n");
+			}
 		}
 		return dw9807_set_dac(client, ctrl->val);
 	}

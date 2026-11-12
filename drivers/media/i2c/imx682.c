@@ -70,7 +70,9 @@
  * board this data comes from: both the vendor's lane assignment and
  * CSI_LANE_MODE (0x0114 = 0x02) in every one of its mode tables say so.
  */
-#define IMX682_LINK_FREQ	953600000
+#define IMX682_LINK_FREQ	953600000	/* 4624x3472 at 30 fps */
+#define IMX682_LINK_FREQ_4K60	870400000	/* 3840x2160 at 60 fps */
+#define IMX682_LINK_FREQ_1080	1040000000	/* 1920x1080 (the 240 fps mode, run at 60) */
 #define IMX682_NUM_DATA_LANES	3
 
 #define IMX682_REG_MIN		0x00
@@ -181,6 +183,8 @@ struct imx682 {
 
 static const s64 link_freq[] = {
 	IMX682_LINK_FREQ,
+	IMX682_LINK_FREQ_4K60,
+	IMX682_LINK_FREQ_1080,
 };
 
 /* Global settings, applied before the mode registers */
@@ -925,23 +929,224 @@ static const struct imx682_reg mode_4624x3472_regs[] = {
 };
 
 /*
+ * The 60 fps modes, from the same vendor module data as the 4624x3472 table (gnome/device/camera/sensor-modes,
+ * chromatix_modes.py, which reproduces that table register for register). Pixel rate = 19.2 MHz / 0x0305 *
+ * 0x0306:0307 / 0x0301 * 4, link = 19.2 MHz / 0x030d * 0x030e:030f / 2; both give the vendor's frame rates.
+ */
+/* 3840x2160: vendor mode at 60.02 fps, line 5144 frame 2218, pixel rate 684800000, link 870400000, 60 fps at frame length 2218 */
+static const struct imx682_reg mode_3840x2160_regs[] = {
+	{0x0112, 0x0a},
+	{0x0113, 0x0a},
+	{0x0114, 0x02},
+	{0x0342, 0x13},
+	{0x0343, 0xdf},
+	{0x0340, 0x08},
+	{0x0341, 0xaa},
+	{0x0344, 0x00},
+	{0x0345, 0x00},
+	{0x0346, 0x05},
+	{0x0347, 0x20},
+	{0x0348, 0x24},
+	{0x0349, 0x1f},
+	{0x034a, 0x15},
+	{0x034b, 0xff},
+	{0x0900, 0x01},
+	{0x0901, 0x22},
+	{0x0902, 0x08},
+	{0x30d8, 0x00},
+	{0x3200, 0x41},
+	{0x3201, 0x41},
+	{0x0408, 0x01},
+	{0x0409, 0x88},
+	{0x040a, 0x00},
+	{0x040b, 0x00},
+	{0x040c, 0x0f},
+	{0x040d, 0x00},
+	{0x040e, 0x08},
+	{0x040f, 0x70},
+	{0x034c, 0x0f},
+	{0x034d, 0x00},
+	{0x034e, 0x08},
+	{0x034f, 0x70},
+	{0x0301, 0x08},
+	{0x0303, 0x02},
+	{0x0305, 0x03},
+	{0x0306, 0x00},
+	{0x0307, 0xd6},
+	{0x030b, 0x02},
+	{0x030d, 0x03},
+	{0x030e, 0x01},
+	{0x030f, 0x10},
+	{0x0310, 0x01},
+	{0x30d9, 0x01},
+	{0x32d5, 0x00},
+	{0x32d6, 0x00},
+	{0x401e, 0x00},
+	{0x40b8, 0x01},
+	{0x40b9, 0xfe},
+	{0x40bc, 0x00},
+	{0x40bd, 0xcc},
+	{0x40be, 0x00},
+	{0x40bf, 0xcc},
+	{0x41a4, 0x00},
+	{0x5a09, 0x01},
+	{0x5a17, 0x01},
+	{0x5a25, 0x01},
+	{0x5a33, 0x01},
+	{0x98d7, 0xb4},
+	{0x98d8, 0x8c},
+	{0x98d9, 0x0a},
+	{0x99c4, 0x16},
+	{0x0202, 0x08},
+	{0x0203, 0x7a},
+	{0x0204, 0x00},
+	{0x0205, 0x00},
+	{0x020e, 0x01},
+	{0x020f, 0x00},
+	{0x4018, 0x00},
+	{0x4019, 0x00},
+	{0x401a, 0x00},
+	{0x401b, 0x00},
+	{0x3400, 0x02},
+	{0x3093, 0x00},
+};
+
+/* 1920x1080: vendor mode at 240.12 fps, line 2728 frame 1148, pixel rate 752000000, link 1040000000, 60 fps at frame length 4594 */
+static const struct imx682_reg mode_1920x1080_regs[] = {
+	{0x0112, 0x0a},
+	{0x0113, 0x0a},
+	{0x0114, 0x02},
+	{0x0342, 0x0a},
+	{0x0343, 0xa8},
+	{0x0340, 0x04},
+	{0x0341, 0x7c},
+	{0x0344, 0x00},
+	{0x0345, 0x00},
+	{0x0346, 0x05},
+	{0x0347, 0x20},
+	{0x0348, 0x24},
+	{0x0349, 0x1f},
+	{0x034a, 0x15},
+	{0x034b, 0xff},
+	{0x0900, 0x01},
+	{0x0901, 0x44},
+	{0x0902, 0x08},
+	{0x30d8, 0x00},
+	{0x3200, 0x43},
+	{0x3201, 0x43},
+	{0x0408, 0x00},
+	{0x0409, 0xc4},
+	{0x040a, 0x00},
+	{0x040b, 0x00},
+	{0x040c, 0x07},
+	{0x040d, 0x80},
+	{0x040e, 0x04},
+	{0x040f, 0x38},
+	{0x034c, 0x07},
+	{0x034d, 0x80},
+	{0x034e, 0x04},
+	{0x034f, 0x38},
+	{0x0301, 0x08},
+	{0x0303, 0x02},
+	{0x0305, 0x03},
+	{0x0306, 0x00},
+	{0x0307, 0xeb},
+	{0x030b, 0x02},
+	{0x030d, 0x03},
+	{0x030e, 0x01},
+	{0x030f, 0x45},
+	{0x0310, 0x01},
+	{0x30d9, 0x01},
+	{0x32d5, 0x00},
+	{0x32d6, 0x00},
+	{0x401e, 0x4d},
+	{0x40b8, 0x00},
+	{0x40b9, 0x32},
+	{0x40bc, 0x00},
+	{0x40bd, 0x08},
+	{0x40be, 0x00},
+	{0x40bf, 0x08},
+	{0x41a4, 0x00},
+	{0x5a09, 0x00},
+	{0x5a17, 0x00},
+	{0x5a25, 0x00},
+	{0x5a33, 0x00},
+	{0x98d7, 0xb4},
+	{0x98d8, 0x8c},
+	{0x98d9, 0x0a},
+	{0x99c4, 0x16},
+	{0x0202, 0x04},
+	{0x0203, 0x4c},
+	{0x0204, 0x00},
+	{0x0205, 0x00},
+	{0x020e, 0x01},
+	{0x020f, 0x00},
+	{0x4018, 0x00},
+	{0x4019, 0x00},
+	{0x401a, 0x00},
+	{0x401b, 0x00},
+	{0x3400, 0x01},
+	{0x3093, 0x00},
+};
+
+/*
  * Line length is 9432 and frame length 3528, which with the 998.4MHz pixel
  * clock the mode's PLL dividers produce gives the 30fps the vendor data
  * declares for it.
  */
-static const struct imx682_mode supported_mode = {
-	.width = 4624,
-	.height = 3472,
-	.hblank = 4808,
-	.vblank = 56,
-	.vblank_min = 56,
-	.vblank_max = 62063,
-	.pclk = 998400000,
-	.link_freq_idx = 0,
-	.code = MEDIA_BUS_FMT_SRGGB10_1X10,
-	.reg_list = {
-		.num_of_regs = ARRAY_SIZE(mode_4624x3472_regs),
-		.regs = mode_4624x3472_regs,
+static const struct imx682_mode supported_modes[] = {
+	{
+		.width = 4624,
+		.height = 3472,
+		.hblank = 4808,
+		.vblank = 56,
+		.vblank_min = 56,
+		.vblank_max = 62063,
+		.pclk = 998400000,
+		.link_freq_idx = 0,
+		.code = MEDIA_BUS_FMT_SRGGB10_1X10,
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_4624x3472_regs),
+			.regs = mode_4624x3472_regs,
+		},
+	}, {
+		/*
+		 * 2x2 binned, a 16:9 crop of the array, 60 fps at frame length 2218. The sensor counts lines at an
+		 * effective 677 MHz, not the 684.8 the PLL settings work out to (measured from frame timestamps across
+		 * line lengths 4864-5144), so the vendor's line length 5144 ran at 59.3 fps; 5087 gives 60.00.
+		 */
+		.width = 3840,
+		.height = 2160,
+		.hblank = 5087 - 3840,
+		.vblank = 2218 - 2160,
+		.vblank_min = 2218 - 2160,
+		.vblank_max = 65535 - 2160,
+		.pclk = 677000000,
+		.link_freq_idx = 1,
+		.code = MEDIA_BUS_FMT_SRGGB10_1X10,
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_3840x2160_regs),
+			.regs = mode_3840x2160_regs,
+		},
+	}, {
+		/*
+		 * 4x4 binned, the same crop: a 240 fps mode (frame length 1148), started at 60 fps (4571); a 2 MP raw
+		 * frame is light work for the soft ISP's 1080p60. Lines run at an effective 748.3 MHz here (59.71 fps
+		 * measured at frame length 4594), not the PLL's 752.
+		 */
+		.width = 1920,
+		.height = 1080,
+		.hblank = 2728 - 1920,
+		.vblank = 4571 - 1080,
+		.vblank_min = 1148 - 1080,
+		.vblank_max = 65535 - 1080,
+		.pclk = 748300000,
+		.link_freq_idx = 2,
+		.code = MEDIA_BUS_FMT_SRGGB10_1X10,
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_1920x1080_regs),
+			.regs = mode_1920x1080_regs,
+		},
 	},
 };
 
@@ -1057,12 +1262,24 @@ static int imx682_update_controls(struct imx682 *imx682,
 	if (ret)
 		return ret;
 
-	ret = __v4l2_ctrl_s_ctrl(imx682->hblank_ctrl, mode->hblank);
+	ret = __v4l2_ctrl_modify_range(imx682->pclk_ctrl, mode->pclk, mode->pclk, 1, mode->pclk);
 	if (ret)
 		return ret;
 
-	return __v4l2_ctrl_modify_range(imx682->vblank_ctrl, mode->vblank_min,
-					mode->vblank_max, 1, mode->vblank);
+	ret = __v4l2_ctrl_modify_range(imx682->hblank_ctrl, mode->hblank, mode->hblank, 1, mode->hblank);
+	if (ret)
+		return ret;
+
+	ret = __v4l2_ctrl_modify_range(imx682->vblank_ctrl, mode->vblank_min,
+				       mode->vblank_max, 1, mode->vblank);
+	if (ret)
+		return ret;
+
+	/*
+	 * modify_range keeps the current value when it is in the new range, so a 4K run's minimum vblank would
+	 * otherwise start the 1080 mode at 234 fps instead of its 60.
+	 */
+	return __v4l2_ctrl_s_ctrl(imx682->vblank_ctrl, mode->vblank);
 }
 
 /**
@@ -1131,12 +1348,18 @@ static int imx682_set_ctrl(struct v4l2_ctrl *ctrl)
 			imx682->vblank,
 			imx682->vblank + imx682->cur_mode->height);
 
+		/*
+		 * The default must fit the range: the 60 fps modes' frames (2218 lines at 4K, down to 1148 at 1080p)
+		 * are shorter than the 3480-line default, and an out-of-range default fails with -ERANGE.
+		 */
 		ret = __v4l2_ctrl_modify_range(imx682->exp_ctrl,
 					       IMX682_EXPOSURE_MIN,
 					       imx682->vblank +
 					       imx682->cur_mode->height -
 					       IMX682_EXPOSURE_OFFSET,
-					       1, IMX682_EXPOSURE_DEFAULT);
+					       1, min_t(u32, IMX682_EXPOSURE_DEFAULT,
+							imx682->vblank + imx682->cur_mode->height -
+							IMX682_EXPOSURE_OFFSET));
 		break;
 	case V4L2_CID_EXPOSURE:
 		/* Set controls only if sensor is in power on state */
@@ -1153,6 +1376,11 @@ static int imx682_set_ctrl(struct v4l2_ctrl *ctrl)
 
 		pm_runtime_put(imx682->dev);
 
+		break;
+	case V4L2_CID_LINK_FREQ:
+	case V4L2_CID_PIXEL_RATE:
+	case V4L2_CID_HBLANK:
+		/* read-only: they follow the mode (imx682_update_controls()), nothing to write */
 		break;
 	default:
 		dev_err(imx682->dev, "Invalid control %d", ctrl->id);
@@ -1182,7 +1410,7 @@ static int imx682_enum_mbus_code(struct v4l2_subdev *sd,
 	if (code->index > 0)
 		return -EINVAL;
 
-	code->code = supported_mode.code;
+	code->code = supported_modes[0].code;
 
 	return 0;
 }
@@ -1199,15 +1427,15 @@ static int imx682_enum_frame_size(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_state *sd_state,
 				  struct v4l2_subdev_frame_size_enum *fsize)
 {
-	if (fsize->index > 0)
+	if (fsize->index >= ARRAY_SIZE(supported_modes))
 		return -EINVAL;
 
-	if (fsize->code != supported_mode.code)
+	if (fsize->code != supported_modes[fsize->index].code)
 		return -EINVAL;
 
-	fsize->min_width = supported_mode.width;
+	fsize->min_width = supported_modes[fsize->index].width;
 	fsize->max_width = fsize->min_width;
-	fsize->min_height = supported_mode.height;
+	fsize->min_height = supported_modes[fsize->index].height;
 	fsize->max_height = fsize->min_height;
 
 	return 0;
@@ -1282,7 +1510,8 @@ static int imx682_set_pad_format(struct v4l2_subdev *sd,
 
 	mutex_lock(&imx682->mutex);
 
-	mode = &supported_mode;
+	mode = v4l2_find_nearest_size(supported_modes, ARRAY_SIZE(supported_modes), width, height,
+				      fmt->format.width, fmt->format.height);
 	imx682_fill_pad_format(imx682, mode, fmt);
 
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
@@ -1315,7 +1544,7 @@ static int imx682_init_state(struct v4l2_subdev *sd,
 	struct v4l2_subdev_format fmt = { };
 
 	fmt.which = sd_state ? V4L2_SUBDEV_FORMAT_TRY : V4L2_SUBDEV_FORMAT_ACTIVE;
-	imx682_fill_pad_format(imx682, &supported_mode, &fmt);
+	imx682_fill_pad_format(imx682, &supported_modes[0], &fmt);
 
 	return imx682_set_pad_format(sd, sd_state, &fmt);
 }
@@ -1728,8 +1957,8 @@ static int imx682_init_controls(struct imx682 *imx682)
 	imx682->hblank_ctrl = v4l2_ctrl_new_std(ctrl_hdlr,
 						&imx682_ctrl_ops,
 						V4L2_CID_HBLANK,
-						IMX682_REG_MIN,
-						IMX682_REG_MAX,
+						mode->hblank,
+						mode->hblank,
 						1, mode->hblank);
 	if (imx682->hblank_ctrl)
 		imx682->hblank_ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
@@ -1832,7 +2061,7 @@ static int imx682_probe(struct i2c_client *client)
 	}
 
 	/* Set default mode to max resolution */
-	imx682->cur_mode = &supported_mode;
+	imx682->cur_mode = &supported_modes[0];
 	imx682->vblank = imx682->cur_mode->vblank;
 
 	ret = imx682_init_controls(imx682);

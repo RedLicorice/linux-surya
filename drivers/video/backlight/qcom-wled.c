@@ -1661,13 +1661,49 @@ static const struct backlight_ops wled_ops = {
 	.update_status = wled_update_status,
 };
 
+/*
+ * The brightness the bootloader left the panel at, scaled to max_brightness, or 0 when the module is off; read before
+ * wled5_setup() rewrites the brightness width. A module the bootloader left on is switched off here: the panel driver
+ * resets and re-initialises the panel before it first enables the backlight, and an LCD lit through that shows a
+ * bright white flash between the boot logo and the splash. Off, it goes dark instead, and the panel driver's
+ * backlight_enable() turns it back on at this brightness once the panel is running again.
+ */
+static u32 wled5_boot_brightness(struct wled *wled)
+{
+	bool mod_a = wled->cfg.mod_sel == MOD_A;
+	u32 ctrl_en, mod_en, width;
+	__le16 v;
+	u32 b;
+
+	if (regmap_read(wled->regmap, wled->ctrl_addr + WLED3_CTRL_REG_MOD_EN, &ctrl_en) ||
+	    regmap_read(wled->regmap, wled->sink_addr + (mod_a ? WLED5_SINK_REG_MOD_A_EN :
+							       WLED5_SINK_REG_MOD_B_EN), &mod_en) ||
+	    regmap_read(wled->regmap, wled->sink_addr + (mod_a ? WLED5_SINK_REG_MOD_A_BRIGHTNESS_WIDTH_SEL :
+							       WLED5_SINK_REG_MOD_B_BRIGHTNESS_WIDTH_SEL), &width) ||
+	    regmap_bulk_read(wled->regmap, wled->sink_addr + (mod_a ? WLED5_SINK_REG_MOD_A_BRIGHTNESS_LSB :
+								    WLED5_SINK_REG_MOD_B_BRIGHTNESS_LSB), &v, sizeof(v)))
+		return 0;
+	if (!(ctrl_en & WLED3_CTRL_REG_MOD_EN_MASK) || !(mod_en & WLED5_SINK_REG_MOD_EN_MASK))
+		return 0;
+
+	regmap_update_bits(wled->regmap, wled->ctrl_addr + WLED3_CTRL_REG_MOD_EN, WLED3_CTRL_REG_MOD_EN_MASK, 0);
+
+	b = le16_to_cpu(v);
+	if (width & WLED5_SINK_REG_BRIGHTNESS_WIDTH_15B)
+		b = (b & WLED5_SINK_REG_BRIGHT_MAX_15B) * wled->max_brightness / WLED5_SINK_REG_BRIGHT_MAX_15B;
+	else
+		b = (b & WLED5_SINK_REG_BRIGHT_MAX_12B) * wled->max_brightness / WLED5_SINK_REG_BRIGHT_MAX_12B;
+	dev_info(wled->dev, "bootloader brightness %u (width sel %u)\n", b, width);
+	return min(b, wled->max_brightness);
+}
+
 static int wled_probe(struct platform_device *pdev)
 {
 	struct backlight_properties props;
 	struct backlight_device *bl;
 	struct wled *wled;
 	struct regmap *regmap;
-	u32 val;
+	u32 val, boot_brightness = 0;
 	int rc;
 
 	regmap = dev_get_regmap(pdev->dev.parent, NULL);
@@ -1721,6 +1757,7 @@ static int wled_probe(struct platform_device *pdev)
 		wled->has_short_detect = true;
 		if (wled->cfg.cabc_sel)
 			wled->max_brightness = WLED5_SINK_REG_BRIGHT_MAX_12B;
+		boot_brightness = wled5_boot_brightness(wled);
 
 		rc = wled5_setup(wled);
 		if (rc) {
@@ -1744,7 +1781,7 @@ static int wled_probe(struct platform_device *pdev)
 	if (rc < 0)
 		return rc;
 
-	val = WLED_DEFAULT_BRIGHTNESS;
+	val = boot_brightness ?: WLED_DEFAULT_BRIGHTNESS;
 	of_property_read_u32(pdev->dev.of_node, "default-brightness", &val);
 
 	memset(&props, 0, sizeof(struct backlight_properties));

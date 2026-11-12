@@ -355,7 +355,18 @@ static int nt36672c_tianma_get_modes(struct drm_panel *panel,
 	return drm_connector_helper_get_modes_fixed(connector, &nt36672c_tianma_mode);
 }
 
+/*
+ * The DRM core turns the backlight on right after this, and the video stream has only just started: lit before the
+ * panel has shown a frame, the LCD flashed white (no picture) between the boot logo and the splash.
+ */
+static int nt36672c_tianma_enable(struct drm_panel *panel)
+{
+	msleep(100);
+	return 0;
+}
+
 static const struct drm_panel_funcs nt36672c_tianma_panel_funcs = {
+	.enable = nt36672c_tianma_enable,
 	.prepare = nt36672c_tianma_prepare,
 	.unprepare = nt36672c_tianma_unprepare,
 	.get_modes = nt36672c_tianma_get_modes,
@@ -378,7 +389,11 @@ static int nt36672c_tianma_probe(struct mipi_dsi_device *dsi)
 		return dev_err_probe(dev, PTR_ERR(ctx->supply),
 				     "Failed to get vddio regulator\n");
 
-	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+	/*
+	 * As is: the bootloader left the panel running and showing its logo. Asserting reset here, at probe, blanked it
+	 * with the backlight still on (a white flash) long before prepare() resets and re-initialises it anyway.
+	 */
+	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_ASIS);
 	if (IS_ERR(ctx->reset_gpio))
 		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
 				     "Failed to get reset-gpios\n");

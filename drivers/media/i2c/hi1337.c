@@ -1624,7 +1624,7 @@ static const struct cci_reg_sequence hi1337_4208x3120_regs[] = {
 	{ CCI_REG16(0x160e), 0x0d80 },
 };
 /* 2104x1560 RAW10 (2x2 binning), 4 lanes, 30.2 fps (pixel rate 288 MHz, link 360 MHz) */
-static const struct cci_reg_sequence __maybe_unused hi1337_2104x1560_regs[] = {
+static const struct cci_reg_sequence hi1337_2104x1560_regs[] = {
 	{ CCI_REG16(0x0b00), 0x0000 },
 	{ CCI_REG16(0x0204), 0x0200 },
 	{ CCI_REG16(0x0206), 0x02d0 },
@@ -1656,7 +1656,7 @@ static const struct cci_reg_sequence __maybe_unused hi1337_2104x1560_regs[] = {
 	{ CCI_REG16(0x0f04), 0x0004 },
 	{ CCI_REG16(0x0b02), 0x0100 },
 	{ CCI_REG16(0x0b04), 0x00fc },
-	{ CCI_REG16(0x0b12), 0x0838 },
+	{ CCI_REG16(0x0b12), 0x0830 },
 	{ CCI_REG16(0x0b14), 0x0618 },
 	{ CCI_REG16(0x0b20), 0x0200 },
 	{ CCI_REG16(0x1100), 0x1100 },
@@ -1739,18 +1739,15 @@ static const struct hi1337_mode hi1337_modes[] = {
 		.regs = hi1337_4208x3120_regs, .num_regs = ARRAY_SIZE(hi1337_4208x3120_regs),
 	},
 	/*
-	 * 2104x1560 (binned, 360 MHz link) streams but its frames arrive with
-	 * horizontal bands of shifted Bayer phase and garbled lines. Until that is
-	 * understood only the full mode is offered: the ISP scales it down, and
-	 * it holds 30 fps.
+	 * 2x2 binned at 60 fps (the vendor's frame length 1666 for 60.02 fps). The vendor's 2104-pixel lines
+	 * are 2630 bytes of RAW10, not a multiple of 4: frames arrived with bands of shifted Bayer phase and
+	 * garbled lines. The output is cropped to 2096 (0x0b12), 2620 bytes.
 	 */
-#if 0
 	{
-		.width = 2104, .height = 1560, .hts = 2880, .vts = 3311,
+		.width = 2096, .height = 1560, .hts = 2880, .vts = 1666,
 		.pixel_rate = 288000000, .link_freq_index = 1,
 		.regs = hi1337_2104x1560_regs, .num_regs = ARRAY_SIZE(hi1337_2104x1560_regs),
 	},
-#endif
 };
 
 struct hi1337 {

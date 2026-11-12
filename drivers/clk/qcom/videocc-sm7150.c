@@ -5,6 +5,7 @@
  */
 
 #include <linux/clk-provider.h>
+#include <linux/io.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
@@ -91,6 +92,12 @@ static const struct freq_tbl ftbl_videocc_iris_clk_src[] = {
 	F(365000000, P_VIDEOCC_PLL0_OUT_MAIN, 2, 0, 0),
 	F(444000000, P_VIDEOCC_PLL0_OUT_MAIN, 2, 0, 0),
 	F(533000000, P_VIDEOCC_PLL0_OUT_MAIN, 2, 0, 0),
+	{ }
+};
+
+/* multipipe fused off: one rate, PLL0 at L 0x14 (downstream video_multipipe_fixup) */
+static const struct freq_tbl ftbl_videocc_iris_clk_src_single_pipe[] = {
+	F(192000000, P_VIDEOCC_PLL0_OUT_MAIN, 2, 0, 0),
 	{ }
 };
 
@@ -330,10 +337,27 @@ MODULE_DEVICE_TABLE(of, videocc_sm7150_match_table);
 static int videocc_sm7150_probe(struct platform_device *pdev)
 {
 	struct regmap *regmap;
+	void __iomem *fuse;
 
 	regmap = qcom_cc_map(pdev, &videocc_sm7150_desc);
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
+
+	/*
+	 * Parts with the video block's multipipe fused off (QFPROM 0x786018 bit 10:
+	 * the POCO X3 NFC) are rated for 200 MHz video clocks only. At 240 MHz the
+	 * IRIS1 core hung the SoC as soon as it processed a frame. Downstream
+	 * lowers PLL0 to L 0x14 and allows that single rate.
+	 */
+	fuse = ioremap(0x00786018, 4);
+	if (fuse) {
+		if (readl(fuse) & BIT(10)) {
+			videocc_pll0_config.l = 0x14;
+			videocc_iris_clk_src.freq_tbl = ftbl_videocc_iris_clk_src_single_pipe;
+			dev_info(&pdev->dev, "video multipipe fused off: iris clock at 192 MHz\n");
+		}
+		iounmap(fuse);
+	}
 
 	clk_fabia_pll_configure(&videocc_pll0, regmap, &videocc_pll0_config);
 

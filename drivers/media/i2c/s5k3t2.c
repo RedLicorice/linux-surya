@@ -194,6 +194,7 @@ struct s5k3t2 {
 
 static const s64 link_freq[] = {
 	S5K3T2_LINK_FREQ,
+	300000000,	/* the 1280x720 mode: 19.2MHz / 2 * 125 / 4 */
 };
 
 /*
@@ -562,25 +563,206 @@ static const struct s5k3t2_reg mode_5184x3880_regs[] = {
 };
 
 /*
+ * 2x2 binned, the whole array. The vendor table runs it at 30.13fps with the
+ * MIPI PLL at 299.2MHz (0x0310 0xbb, 0x0312 2), where a 2592-pixel line needs
+ * 10880 pixel clocks to leave the sensor. Here it keeps the full mode's 896MHz
+ * link (0x030e 3, 0x0310 0x8c, 0x0312 0) and the full mode's line length 5440
+ * (0x0342), which is 60.26fps over the same 2064-line frame.
+ */
+static const struct s5k3t2_reg mode_2592x1940_regs[] = {
+	{0x6028, 0x4000},
+	{0x0136, 0x1300},
+	{0x013e, 0x00c8},
+	{0x0304, 0x0003},
+	{0x0306, 0x00b9},
+	{0x6028, 0x2000},
+	{0x602a, 0x0e0e},
+	{0x6f12, 0x0104},
+	{0x6f12, 0x0000},
+	{0x602a, 0x1078},
+	{0x6f12, 0x04a6},
+	{0x6028, 0x4000},
+	{0x030c, 0x0000},
+	{0x0302, 0x0001},
+	{0x0300, 0x0007},
+	{0x030e, 0x0003},
+	{0x0310, 0x008c},
+	{0x0312, 0x0000},
+	{0x0308, 0x0008},
+	{0x030a, 0x0001},
+	{0x0344, 0x0008},
+	{0x0346, 0x0008},
+	{0x0348, 0x1447},
+	{0x034a, 0x0f2f},
+	{0x034c, 0x0a20},
+	{0x034e, 0x0794},
+	{0x0350, 0x0000},
+	{0x0352, 0x0000},
+	{0x0900, 0x0122},
+	{0x0404, 0x1000},
+	{0x0380, 0x0002},
+	{0x0382, 0x0002},
+	{0x0384, 0x0002},
+	{0x0386, 0x0002},
+	{0x0342, 0x1540},
+	{0x0340, 0x0810},
+	{0x6028, 0x4000},
+	{0x010c, 0x0000},
+	{0x0114, 0x0300},
+	{0x0116, 0x3000},
+	{0x011a, 0x0001},
+	{0x0118, 0x0002},
+	{0x6028, 0x2000},
+	{0x602a, 0x0e92},
+	{0x6f12, 0xffff},
+	{0x602a, 0x165a},
+	{0x6f12, 0x0003},
+	{0x6028, 0x4000},
+	{0x0b04, 0x0001},
+	{0x0b06, 0x0101},
+	{0x0fea, 0x04a0},
+	{0x6028, 0x2000},
+	{0x602a, 0x3c98},
+	{0x6f12, 0x052c},
+	{0x6f12, 0x0a3b},
+	{0x602a, 0x1da0},
+	{0x6f12, 0x0010},
+	{0x602a, 0x10ac},
+	{0x6f12, 0x0014},
+	{0x602a, 0x1110},
+	{0x6f12, 0x001d},
+	{0x6f12, 0x004d},
+	{0x602a, 0x13e8},
+	{0x6f12, 0x080f},
+	{0x602a, 0x13f8},
+	{0x6f12, 0x38c8},
+};
+
+/*
+ * 4x4 binned 16:9 crop, verbatim from the vendor data (120.41fps, frame 992),
+ * started at 60fps (frame 1984, 0x0340) for video.
+ */
+static const struct s5k3t2_reg mode_1280x720_regs[] = {
+	{0x6028, 0x4000},
+	{0x0136, 0x1300},
+	{0x013e, 0x00c8},
+	{0x0304, 0x0003},
+	{0x0306, 0x00b9},
+	{0x6028, 0x2000},
+	{0x602a, 0x0e0e},
+	{0x6f12, 0x0104},
+	{0x6f12, 0x0000},
+	{0x602a, 0x1078},
+	{0x6f12, 0x04a6},
+	{0x6028, 0x4000},
+	{0x030c, 0x0000},
+	{0x0302, 0x0001},
+	{0x0300, 0x0007},
+	{0x030e, 0x0002},
+	{0x0310, 0x007d},
+	{0x0312, 0x0002},
+	{0x0308, 0x0008},
+	{0x030a, 0x0001},
+	{0x0344, 0x0028},
+	{0x0346, 0x01fc},
+	{0x0348, 0x1427},
+	{0x034a, 0x0d3b},
+	{0x034c, 0x0500},
+	{0x034e, 0x02d0},
+	{0x0350, 0x0000},
+	{0x0352, 0x0000},
+	{0x0900, 0x0124},
+	{0x0404, 0x2000},
+	{0x0380, 0x0002},
+	{0x0382, 0x0002},
+	{0x0384, 0x0002},
+	{0x0386, 0x0006},
+	{0x0342, 0x1620},
+	{0x0340, 0x07c0},
+	{0x6028, 0x4000},
+	{0x010c, 0x0000},
+	{0x0114, 0x0300},
+	{0x0116, 0x3000},
+	{0x011a, 0x0001},
+	{0x0118, 0x0002},
+	{0x6028, 0x2000},
+	{0x602a, 0x0e92},
+	{0x6f12, 0xffff},
+	{0x602a, 0x165a},
+	{0x6f12, 0x0020},
+	{0x6028, 0x4000},
+	{0x0b04, 0x0001},
+	{0x0b06, 0x0101},
+	{0x0fea, 0x04a0},
+	{0x6028, 0x2000},
+	{0x602a, 0x3c98},
+	{0x6f12, 0x0296},
+	{0x6f12, 0x0515},
+	{0x602a, 0x1da0},
+	{0x6f12, 0x0110},
+	{0x602a, 0x10ac},
+	{0x6f12, 0x0014},
+	{0x602a, 0x1110},
+	{0x6f12, 0x001d},
+	{0x6f12, 0x004d},
+	{0x602a, 0x13e8},
+	{0x6f12, 0x080f},
+	{0x602a, 0x13f8},
+	{0x6f12, 0x38c8},
+};
+
+/*
  * The vendor data declares this mode at 29.90fps, and the mode's own PLL
  * reproduces that exactly: 19.2MHz / 3 (0x0304) * 185 (0x0306) / (1 (0x0302) *
  * 7 (0x0300)) is 169.14MHz, four pixels a clock is 676.57MHz, and over the
  * 5440 (0x0342) by 4160 (0x0340) frame that is 29.90fps.
  */
-static const struct s5k3t2_mode supported_mode = {
-	.width = 5184,
-	.height = 3880,
-	.hblank = 256,
-	.vblank = 280,
-	.vblank_min = 280,
-	.vblank_max = 61375,
-	.pclk = 676571428,
-	.link_freq_idx = 0,
-	/* Not confirmed: the vendor data does not carry the Bayer order. */
-	.code = MEDIA_BUS_FMT_SGRBG10_1X10,
-	.reg_list = {
-		.num_of_regs = ARRAY_SIZE(mode_5184x3880_regs),
-		.regs = mode_5184x3880_regs,
+static const struct s5k3t2_mode supported_modes[] = {
+	{
+		.width = 5184,
+		.height = 3880,
+		.hblank = 256,
+		.vblank = 280,
+		.vblank_min = 280,
+		.vblank_max = 61375,
+		.pclk = 676571428,
+		.link_freq_idx = 0,
+		/* Not confirmed: the vendor data does not carry the Bayer order. */
+		.code = MEDIA_BUS_FMT_SGRBG10_1X10,
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_5184x3880_regs),
+			.regs = mode_5184x3880_regs,
+		},
+	},
+	{
+		.width = 2592,
+		.height = 1940,
+		.hblank = 5440 - 2592,
+		.vblank = 2064 - 1940,
+		.vblank_min = 2064 - 1940,
+		.vblank_max = 65535 - 1940,
+		.pclk = 676571428,
+		.link_freq_idx = 0,
+		.code = MEDIA_BUS_FMT_SGRBG10_1X10,
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_2592x1940_regs),
+			.regs = mode_2592x1940_regs,
+		},
+	},
+	{
+		.width = 1280,
+		.height = 720,
+		.hblank = 5664 - 1280,
+		.vblank = 1984 - 720,
+		.vblank_min = 992 - 720,
+		.vblank_max = 65535 - 720,
+		.pclk = 676571428,
+		.link_freq_idx = 1,
+		.code = MEDIA_BUS_FMT_SGRBG10_1X10,
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_1280x720_regs),
+			.regs = mode_1280x720_regs,
+		},
 	},
 };
 
@@ -700,12 +882,17 @@ static int s5k3t2_update_controls(struct s5k3t2 *s5k3t2,
 	if (ret)
 		return ret;
 
-	ret = __v4l2_ctrl_s_ctrl(s5k3t2->hblank_ctrl, mode->hblank);
+	ret = __v4l2_ctrl_modify_range(s5k3t2->hblank_ctrl, mode->hblank, mode->hblank, 1, mode->hblank);
 	if (ret)
 		return ret;
 
-	return __v4l2_ctrl_modify_range(s5k3t2->vblank_ctrl, mode->vblank_min,
-					mode->vblank_max, 1, mode->vblank);
+	ret = __v4l2_ctrl_modify_range(s5k3t2->vblank_ctrl, mode->vblank_min,
+				       mode->vblank_max, 1, mode->vblank);
+	if (ret)
+		return ret;
+
+	/* modify_range keeps a value still in range: start every mode at its own frame rate */
+	return __v4l2_ctrl_s_ctrl(s5k3t2->vblank_ctrl, mode->vblank);
 }
 
 /**
@@ -773,7 +960,15 @@ static int s5k3t2_set_ctrl(struct v4l2_ctrl *ctrl)
 					       s5k3t2->vblank +
 					       s5k3t2->cur_mode->height -
 					       S5K3T2_EXPOSURE_OFFSET,
-					       1, S5K3T2_EXPOSURE_DEFAULT);
+					       1, min_t(u32, S5K3T2_EXPOSURE_DEFAULT,
+							s5k3t2->vblank + s5k3t2->cur_mode->height -
+							S5K3T2_EXPOSURE_OFFSET));
+		break;
+	case V4L2_CID_LINK_FREQ:
+	case V4L2_CID_HBLANK:
+	case V4L2_CID_PIXEL_RATE:
+		/* read-only, set by the mode: nothing to write */
+		ret = 0;
 		break;
 	case V4L2_CID_EXPOSURE:
 		/* Set controls only if sensor is in power on state */
@@ -819,7 +1014,7 @@ static int s5k3t2_enum_mbus_code(struct v4l2_subdev *sd,
 	if (code->index > 0)
 		return -EINVAL;
 
-	code->code = supported_mode.code;
+	code->code = supported_modes[0].code;
 
 	return 0;
 }
@@ -836,15 +1031,15 @@ static int s5k3t2_enum_frame_size(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_state *sd_state,
 				  struct v4l2_subdev_frame_size_enum *fsize)
 {
-	if (fsize->index > 0)
+	if (fsize->index >= ARRAY_SIZE(supported_modes))
 		return -EINVAL;
 
-	if (fsize->code != supported_mode.code)
+	if (fsize->code != supported_modes[fsize->index].code)
 		return -EINVAL;
 
-	fsize->min_width = supported_mode.width;
+	fsize->min_width = supported_modes[fsize->index].width;
 	fsize->max_width = fsize->min_width;
-	fsize->min_height = supported_mode.height;
+	fsize->min_height = supported_modes[fsize->index].height;
 	fsize->max_height = fsize->min_height;
 
 	return 0;
@@ -919,7 +1114,8 @@ static int s5k3t2_set_pad_format(struct v4l2_subdev *sd,
 
 	mutex_lock(&s5k3t2->mutex);
 
-	mode = &supported_mode;
+	mode = v4l2_find_nearest_size(supported_modes, ARRAY_SIZE(supported_modes),
+				      width, height, fmt->format.width, fmt->format.height);
 	s5k3t2_fill_pad_format(s5k3t2, mode, fmt);
 
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
@@ -952,7 +1148,7 @@ static int s5k3t2_init_state(struct v4l2_subdev *sd,
 	struct v4l2_subdev_format fmt = { };
 
 	fmt.which = sd_state ? V4L2_SUBDEV_FORMAT_TRY : V4L2_SUBDEV_FORMAT_ACTIVE;
-	s5k3t2_fill_pad_format(s5k3t2, &supported_mode, &fmt);
+	s5k3t2_fill_pad_format(s5k3t2, &supported_modes[0], &fmt);
 
 	return s5k3t2_set_pad_format(sd, sd_state, &fmt);
 }
@@ -1373,8 +1569,8 @@ static int s5k3t2_init_controls(struct s5k3t2 *s5k3t2)
 	s5k3t2->hblank_ctrl = v4l2_ctrl_new_std(ctrl_hdlr,
 						&s5k3t2_ctrl_ops,
 						V4L2_CID_HBLANK,
-						S5K3T2_REG_MIN,
-						S5K3T2_REG_MAX,
+						mode->hblank,
+						mode->hblank,
 						1, mode->hblank);
 	if (s5k3t2->hblank_ctrl)
 		s5k3t2->hblank_ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
@@ -1454,7 +1650,7 @@ static int s5k3t2_probe(struct i2c_client *client)
 	}
 
 	/* Set default mode to max resolution */
-	s5k3t2->cur_mode = &supported_mode;
+	s5k3t2->cur_mode = &supported_modes[0];
 	s5k3t2->vblank = s5k3t2->cur_mode->vblank;
 
 	ret = s5k3t2_init_controls(s5k3t2);

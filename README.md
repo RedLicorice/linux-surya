@@ -1,14 +1,33 @@
-Linux 7.2.10 for the POCO X3 NFC (surya)
+Linux 7.2.15 for the POCO X3 NFC (surya)
 ========================================
 
 Mainline Linux for the Xiaomi POCO X3 NFC (codename surya, Snapdragon 732G / SM7150).
-It runs the phone on **Mobian** (Debian sid with Mobian's staging repository) with Phosh, GNOME's mobile
-shell, and the [Neo launcher](https://github.com/pulpoff/neo-gnome). It is not a postmarketOS kernel: it is built
+It runs the phone on **Mobian** (Debian sid with Mobian's staging repository) with GNOME Shell and
+[gnome-phone](https://github.com/pulpoff/gnome-phone) (no Phosh). It is not a postmarketOS kernel: it is built
 as a Debian package (`make bindeb-pkg`) and installed with dpkg like any other Debian kernel.
 
-The tree is stable **v7.2.10**, plus the SM7150 work of
-[sm7150-mainline/linux](https://github.com/sm7150-mainline/linux) (branch `v7.2`), plus the
-surya changes listed below.
+The tree is stable **v7.2.15**, plus the SM7150 work of
+[sm7150-mainline/linux](https://github.com/sm7150-mainline/linux) (branch `v7.2`, brought up to 7.2.15 with
+the stable incremental patches), plus the surya changes listed below.
+
+7.2.15 is the last 7.2 stable release: kernel.org has marked 7.2 end of life, and this tree stays on it.
+Use the `main` branch; the kernel release is `7.2.15-surya` (`LOCALVERSION=-surya`).
+
+New in this version
+===================
+
+* **Linux 7.2.15.** 7.2.11 to 7.2.15 come from kernel.org's stable patches; none of them touches the
+  surya changes below.
+* **Hardware video decode and encode** (Venus, IRIS1): H.264, HEVC, VP8 and VP9 decode, H.264 and HEVC
+  encode, so camera video records through the hardware encoder; and a fix for seeking in GStreamer
+  players, which hung the decoder. See Video.
+* **60 fps camera video**: 3840x2160 and 1920x1080 on the main camera, 2592x1940 and 1280x720 on the front
+  camera, and the ultrawide's binned mode back at 60 fps. See Cameras.
+* **A cleaner boot picture**: the hand-over from the boot logo to the boot splash no longer flashes white
+  or goes black. See Touchscreen and display.
+* **The top microphone works**: it had no SoundWire port of its own. See Audio.
+* **Sleep:** suspend to idle works with the image's sleep daemon; the kernel has no surya-specific sleep
+  changes yet. What it takes and what is still open is under Suspend.
 
 Changes for the POCO X3 NFC
 ===========================
@@ -27,6 +46,10 @@ Audio: WCD9375 codec, microphones and earpiece
 * **Headset detection (MBHC):** surya thresholds.
 * **TAS2562 speaker amp:** Digital Volume range and MSB-first writes.
 * **Quieter logs:** the q6afe/SoundWire debug prints are toned down.
+* **Top microphone: its own SoundWire port.** The WCD9375's ADC2 (the top mic) shared master port 2, at
+  the same offset, with ADC1 (the bottom mic): the top mic never arrived, and with both on the bottom mic
+  carried full-scale noise. `qcom,tx-port-mapping` is now `<2 3 4 5>`, so ADC2 has port 3. The image's
+  call profile takes the uplink from the top mic, which picks up far less of the loudspeaker's echo.
 
 Modem calls: audio both ways
 ----------------------------
@@ -61,6 +84,18 @@ Touchscreen and display
 * **nt36xxx fix: use-after-free.** `_nt36xxx_boot_download_firmware` released the firmware and
   then read its size and first byte. This faulted in the download worker at boot and could hang
   the phone.
+* **The display hand-over at boot.** Between the boot logo and the boot splash the LCD flashed or went
+  dark several times; each had its own cause:
+  * `qcom-wled` registered at its default brightness (2048 of 4095) and flashed the logo bright: on WLED5 it
+    now starts at the bootloader's brightness. It also switches off a WLED5 module the bootloader left on,
+    and the panel driver switches it on again once the panel runs.
+  * Both nt36672c panel drivers (Huaxing and Tianma) take their reset GPIO as it is instead of asserting
+    reset at probe, and light the backlight 100 ms after the video starts: lit with the first frame, the LCD
+    showed white.
+  * `dispcc-sm7150` leaves a running display PLL0 alone: reconfiguring it under the bootloader's scanout
+    flashed the LCD white.
+  * `msm` fbdev starts with the bootloader's splash picture: after the first modeset a zeroed buffer showed
+    black, glowing at the backlight level, until the splash.
 
 Charging: USB-C power delivery
 ------------------------------
@@ -78,6 +113,24 @@ Charging: USB-C power delivery
   charge current at 1.95 A. The input limit (`current_max`) can be raised from userspace, for
   example by a temperature-guarded service. 9 V PD needs driver work. The 33 W fast charging
   uses an external charge pump with no mainline driver.
+
+Suspend
+-------
+
+Suspend to idle works with this kernel as it is; the image's sleep daemon (`surya-sleepd`) puts the phone
+to sleep when the screen goes off. There are no surya-specific sleep changes in this tree yet. What a sleep
+needs, and what is still open:
+
+* **The FastRPC servers have to be stopped before a sleep** (both hexagonrpcd instances, not only the
+  sensors' one). Frozen through a sleep, they crash the ADSP at resume, and after its restart the VA macro
+  and the SoundWire controller stay in a runtime PM error: no sound until a reboot.
+* **The Bluetooth UART's RX wake ends every sleep after about a second** (its wake IRQ fires as soon as it
+  is armed). With `power/wakeup` of `88c000.serial` set to `disabled` the phone sleeps until something
+  real wakes it. The kernel fix is open.
+* **On a computer's USB port the charger reports an input-limit change about three times a second** (AICL
+  hunting), and each report is a wakeup event that aborts a sleep. A `qcom_smbx` change that reports only
+  real changes is written, not in this tree.
+* Wi-Fi disconnects at every suspend and is back about 4 s after the resume.
 
 Vibration: AW8624 haptics
 -------------------------
@@ -118,6 +171,31 @@ Wi-Fi: 5 GHz channels
   used in, and starts from a table covering all of 2.4 GHz and 5 GHz up to 5875 MHz, so that
   country's rules decide. Set it with `options ath regdomain=DE` in `/etc/modprobe.d/`.
 
+Video: Venus (IRIS1) decode and encode
+--------------------------------------
+
+The SM7150's video core is an IRIS1 with one pipe, a generation mainline's venus driver knows only by name.
+
+* **The driver** (`drivers/media/platform/qcom/venus`) is taken whole from the SM8150 IRIS1 port of
+  [Aospa-raphael-unofficial/linux](https://github.com/Aospa-raphael-unofficial/linux) (branch `venus`, about
+  40 commits by snowf14k3), plus `sm7150_res` (one pipe, the SM7150's video clocks in the port's roles, the
+  `cx` performance domain) and the CVP domain the SM7150's firmware boots in (CTRL_INIT bit 1 and a second,
+  1 MiB queue table).
+* **The encoder's persistent buffer must sit in the secure non-pixel domain** (SID 0x1084, VMID
+  CP_NON_PIXEL), even for normal sessions, and the SMMU's page tables for that domain must be shared with
+  that VM (`iommu/arm-smmu: share Qualcomm secure-domain page tables`, from the same port; DT
+  `qcom,secure-vmid`). With the buffer alone the bus stalled on the first frame. The secure device's
+  addresses are limited in the driver: done with `dma-ranges`, as in the SM8150 port, it left the phone
+  with no ZONE_DMA, and the touchscreen could not load its firmware.
+* **192 MHz.** This phone's video multipipe is fused off (QFPROM), which rates it for 200 MHz only;
+  `videocc-sm7150` runs the video clock at 192 MHz as downstream does, and the DT has that one rate.
+* **Seeking.** GStreamer's decoder flushes for a seek with STREAMOFF on OUTPUT, STREAMOFF and STREAMON on
+  CAPTURE, then STREAMON on OUTPUT. Venus then never decoded again: the capture buffers queued before the
+  restart stayed in the m2m queue, and the decoded picture buffers were not handed back. `vdec` now gives
+  both to the firmware when CAPTURE comes back during a seek.
+* H.264, HEVC, VP8 and VP9 decode, H.264 and HEVC encode; GStreamer's
+  `v4l2h264enc` records the camera at 1080p 30 fps. The video core powers down when idle.
+
 Cameras: CAMSS and sensors
 --------------------------
 
@@ -128,7 +206,7 @@ Status of the cameras:
 | Main       | Sony IMX682 + DW9800 VCM  | CSIPHY0, C-PHY                              | working |
 | Front      | Samsung S5K3T2            | CSIPHY1, D-PHY, behind the CAM_SEL mux      | working |
 | Macro      | SK Hynix Hi-259           | CSIPHY2, combo mode (data lane 2, clock 3)  | working |
-| Ultrawide  | SK Hynix Hi-1337          | CSIPHY1, behind the CAM_SEL mux             | working (full 4208x3120 mode only) |
+| Ultrawide  | SK Hynix Hi-1337          | CSIPHY1, behind the CAM_SEL mux             | working (4208x3120, and 2096x1560 at 60 fps) |
 | Depth      | OmniVision OV02B1B        |                                             | no driver |
 
 ### CAMSS: every SM7150 CSIPHY needs `csiphy0_clk`
@@ -155,7 +233,8 @@ Status of the cameras:
   WirePlumber.
 * **Shared PHYs.** Sensors that share a CSIPHY get mutable links (only the first is enabled), so
   libcamera can switch between them.
-* **Debug cleanup.** The bring-up debug module parameters and trace prints are removed.
+* **Debug cleanup.** The bring-up debug module parameters and trace prints are removed, and so is a stray
+  `#define DEBUG` in `v4l2-subdev` that logged every link validation of each camera start.
 * **A failed stream start no longer breaks every camera.** When one stage failed to start, the
   stages already started stayed marked as streaming, and since all four cameras share CSID0/VFE0,
   every later start was silently skipped until a reboot. The started stages are now stopped again.
@@ -172,6 +251,17 @@ Status of the cameras:
   bright light. The Hi-259 macro's analogue gain goes up to 14x (MediaTek's driver stops at 8x;
   the gain code allows about 15x). Setting only `0x020e`, the green-next-to-red position, left the
   front camera a green and magenta grid.
+* **60 fps video modes**, from the vendor sensor module data:
+  * IMX682 (main): 3840x2160 (2x2 binned, 16:9 crop) and 1920x1080 (4x4 binned) at 60 fps, beside the full
+    4624x3472. The mode is picked by the nearest size; pixel rate, link frequency and blanking follow it,
+    vblank is reset on a mode change, and hblank is advertised exactly, so libcamera gets the line length
+    right. libcamera's software ISP streams 1080p at 59 fps and 720p at 121 fps.
+  * S5K3T2 (front): 2592x1940 (2x2 binned) at 60 fps and 1280x720.
+  * Hi-1337 (ultrawide): the 2x2 binned mode at 60 fps, cropped to 2096 wide (below).
+* **DW9807 Smart Actuator Control** (`sac_mode`, `sac_timing`): the driver never programmed the lens
+  driver's mode (0x06) and resonance timing (0x07), so it ran in direct mode. The two module parameters set
+  them, with ringing control; the values belong to the lens module (this phone's IMX682 module: 0x40 and
+  0x7a, from the vendor's actuator settings). Unset, nothing changes.
 * **Hi-1337 Bayer order is GBRG.** Declared GRBG, as on the Hi-847, red and blue came out swapped:
   a yellow floor and red objects turned blue, and the software ISP's white balance flickered
   between teal and neutral.
@@ -184,15 +274,16 @@ Status of the cameras:
 * **`media: i2c: hi259`:** SK Hynix Hi-259, the 2 MP macro camera. 1600x1200 SBGGR10 on one
   lane at 30 fps, with exposure, gain and test pattern. The tables are decoded from the vendor
   CamX module.
-* **`media: i2c: hi1337`:** SK Hynix Hi-1337, the 13 MP ultrawide, at 4208x3120 and 2104x1560.
+* **`media: i2c: hi1337`:** SK Hynix Hi-1337, the 13 MP ultrawide, at 4208x3120 and 2096x1560 (binned).
   The register tables are written with `cci_multi_reg_write()`. `regmap_multi_reg_write()` on
   the 8-bit CCI regmap dropped the 16-bit width, so only the low byte of each entry went out.
 * **Front and ultrawide no longer knock each other out at boot.** Both sensors share CSIPHY1 and
   power up at probe to read their chip id. The one that probed second found the shared switch busy,
   failed, and took every camera with it, because CAMSS waits for all sensors. A probe now waits up
   to 3 s for the switch.
-* **Hi-1337 offers only its full 4208x3120 mode.** The binned 2104x1560 mode delivered frames with
-  bands of shifted colour and garbled lines. The software ISP scales the full mode down at 30 fps.
+* **Hi-1337's binned mode is 2096 wide.** At 2104 pixels a RAW10 line is 2630 bytes, not a multiple of 4,
+  and the frames arrived with bands of shifted colour and garbled lines. Cropped to 2096 the binned mode
+  works, at 60 fps (frame length 1666).
 * **`media: i2c: imx682`, `media: i2c: s5k3t2`:** the main and front sensors, from
   [woodyst/surya-pmos](https://github.com/woodyst/surya-pmos).
 * **`media: dw9807-vcm`:** the main camera's DW9800 actuator gets its vcc (coil) supply. I2C errors
@@ -217,6 +308,7 @@ Known issues
   every camera (CAMSS waits for all sensors). The probe now power-cycles the sensor and retries.
 * **Untested:** headset microphone and headphone output.
 * **Camera image quality:** no libcamera tuning yet.
+* **Sleep:** see Suspend.
 
 Booting: U-Boot
 ---------------
@@ -263,6 +355,8 @@ Credits
   C-PHY, the DW9807 fixes, refgen/rails/384 MHz.
 * **[asidko/qcom-camss-mainline](https://github.com/asidko/qcom-camss-mainline):** the VFE
   buffer-flush fix.
+* **[Aospa-raphael-unofficial/linux](https://github.com/Aospa-raphael-unofficial/linux):** the IRIS1
+  venus driver and the shared secure-domain SMMU page tables (snowf14k3).
 
 The original kernel README is in [`README`](README).
 

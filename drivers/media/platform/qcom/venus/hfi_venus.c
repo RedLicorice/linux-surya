@@ -123,6 +123,7 @@ struct venus_hfi_device {
 	struct completion pwr_collapse_prep;
 	struct completion release_resource;
 	struct mem_desc ifaceq_table;
+	struct mem_desc dsp_ifaceq_table;	/* domain_cvp: the DSP's queue table (no DSP reads it here) */
 	struct mem_desc sfr;
 	struct iface_queue queues[IFACEQ_NUM];
 	u8 pkt_buf[IFACEQ_VAR_HUGE_PKT_SIZE];
@@ -473,7 +474,11 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 	void __iomem *wrapper_base = hdev->core->wrapper_base;
 	int ret = 0;
 
-	if (IS_IRIS2(hdev->core) || IS_IRIS2_1(hdev->core)) {
+	if (IS_IRIS1(hdev->core)) {
+		mask_val = readl(wrapper_base + WRAPPER_INTR_MASK);
+		mask_val &= ~(WRAPPER_INTR_MASK_A2HWD_BASK |
+			      WRAPPER_INTR_MASK_A2HCPU_MASK);
+	} else if (IS_IRIS2(hdev->core) || IS_IRIS2_1(hdev->core)) {
 		mask_val = readl(wrapper_base + WRAPPER_INTR_MASK);
 		mask_val &= ~(WRAPPER_INTR_MASK_A2HWD_BASK_V6 |
 			      WRAPPER_INTR_MASK_A2HCPU_MASK);
@@ -485,7 +490,9 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 	if (IS_V1(hdev->core))
 		writel(1, cpu_cs_base + CPU_CS_SCIACMDARG3);
 
-	writel(BIT(VIDC_CTRL_INIT_CTRL_SHIFT), cpu_cs_base + VIDC_CTRL_INIT);
+	/* downstream's __boot_firmware(): bit 1 too in the CVP domain ("qcom,domain-cvp") */
+	writel(BIT(VIDC_CTRL_INIT_CTRL_SHIFT) | (hdev->dsp_ifaceq_table.da ? BIT(1) : 0),
+	       cpu_cs_base + VIDC_CTRL_INIT);
 	while (!ctrl_status && count < max_tries) {
 		ctrl_status = readl(cpu_cs_base + CPU_CS_SCIACMDARG0);
 		if ((ctrl_status & CPU_CS_SCIACMDARG0_ERROR_STATUS_MASK) == 4) {
@@ -549,6 +556,17 @@ static int venus_run(struct venus_hfi_device *hdev)
 	if (hdev->sfr.da)
 		writel(hdev->sfr.da, cpu_cs_base + SFR_ADDR);
 
+	if (IS_IRIS1(hdev->core) && hdev->dsp_ifaceq_table.da) {
+		/* downstream setup_dsp_uc_memmap_vpu5() with domain_cvp: the DSP queue table */
+		writel(hdev->dsp_ifaceq_table.da, cpu_cs_base + CPU_CS_DSP_QTBL_ADDR);
+		writel(hdev->dsp_ifaceq_table.da, cpu_cs_base + CPU_CS_DSP_UC_REGION_ADDR);
+		writel(hdev->dsp_ifaceq_table.size, cpu_cs_base + CPU_CS_DSP_UC_REGION_SIZE);
+	} else if (IS_IRIS1(hdev->core)) {
+		writel(hdev->ifaceq_table.da, cpu_cs_base + CPU_CS_DSP_QTBL_ADDR);
+		writel(hdev->ifaceq_table.da, cpu_cs_base + CPU_CS_DSP_UC_REGION_ADDR);
+		writel(SHARED_QSIZE, cpu_cs_base + CPU_CS_DSP_UC_REGION_SIZE);
+	}
+
 	ret = venus_boot_core(hdev);
 	if (ret) {
 		dev_err(dev, "failed to reset venus core\n");
@@ -571,7 +589,8 @@ static int venus_halt_axi(struct venus_hfi_device *hdev)
 	u32 mask_val;
 	int ret;
 
-	if (IS_AR50_LITE(hdev->core))
+	/* VPU5 powers down after the firmware/SCM suspend handshake. */
+	if (IS_IRIS1(hdev->core) || IS_AR50_LITE(hdev->core))
 		return 0;
 
 	if (IS_IRIS2(hdev->core) || IS_IRIS2_1(hdev->core)) {
@@ -780,13 +799,60 @@ static void venus_interface_queues_release(struct venus_hfi_device *hdev)
 	mutex_lock(&hdev->lock);
 
 	venus_free(hdev, &hdev->ifaceq_table);
+	if (hdev->dsp_ifaceq_table.kva)
+		venus_free(hdev, &hdev->dsp_ifaceq_table);
 	venus_free(hdev, &hdev->sfr);
 
 	memset(hdev->queues, 0, sizeof(hdev->queues));
 	memset(&hdev->ifaceq_table, 0, sizeof(hdev->ifaceq_table));
+	memset(&hdev->dsp_ifaceq_table, 0, sizeof(hdev->dsp_ifaceq_table));
 	memset(&hdev->sfr, 0, sizeof(hdev->sfr));
 
 	mutex_unlock(&hdev->lock);
+}
+
+/*
+ * The CVP domain's second queue table (downstream __interface_dsp_queues_init(), handed to the CDSP's fastcvpd
+ * there; downstream goes on when that fails, and no DSP reads it here). 1 MiB as downstream allocates it: the
+ * firmware refused a 4 KiB-aligned size ("invalid setting for UC_REGION").
+ */
+static int venus_dsp_queues_init(struct venus_hfi_device *hdev)
+{
+	struct hfi_queue_table_header *tbl_hdr;
+	struct hfi_queue_header *qhdr;
+	struct mem_desc desc = {0};
+	unsigned int i;
+	int ret;
+
+	ret = venus_alloc(hdev, &desc, ALIGN(ALIGNED_QUEUE_SIZE, SZ_1M));
+	if (ret)
+		return ret;
+
+	for (i = 0; i < IFACEQ_NUM; i++) {
+		qhdr = IFACEQ_GET_QHDR_START_ADDR(desc.kva, i);
+		venus_set_qhdr_defaults(qhdr);
+		qhdr->start_addr = desc.da + IFACEQ_TABLE_SIZE + i * IFACEQ_QUEUE_SIZE;
+		if (i == IFACEQ_CMD_IDX)
+			qhdr->type |= HFI_HOST_TO_CTRL_CMD_Q;
+		else if (i == IFACEQ_MSG_IDX)
+			qhdr->type |= HFI_CTRL_TO_HOST_MSG_Q;
+		else if (i == IFACEQ_DBG_IDX)
+			qhdr->type |= HFI_CTRL_TO_HOST_DBG_Q;
+	}
+
+	tbl_hdr = desc.kva;
+	tbl_hdr->version = 0;
+	tbl_hdr->size = IFACEQ_TABLE_SIZE;
+	tbl_hdr->qhdr0_offset = sizeof(struct hfi_queue_table_header);
+	tbl_hdr->qhdr_size = sizeof(struct hfi_queue_header);
+	tbl_hdr->num_q = IFACEQ_NUM;
+	tbl_hdr->num_active_q = IFACEQ_NUM;
+	qhdr = IFACEQ_GET_QHDR_START_ADDR(desc.kva, IFACEQ_DBG_IDX);
+	qhdr->rx_req = 0;
+
+	wmb();
+	hdev->dsp_ifaceq_table = desc;
+	return 0;
 }
 
 static int venus_interface_queues_init(struct venus_hfi_device *hdev)
@@ -853,6 +919,9 @@ static int venus_interface_queues_init(struct venus_hfi_device *hdev)
 
 	/* ensure table and queue header structs are settled in memory */
 	wmb();
+
+	if (hdev->core->res->domain_cvp && venus_dsp_queues_init(hdev))
+		dev_warn(hdev->core->dev, "no DSP queue table: firmware boots outside the CVP domain\n");
 
 	return 0;
 }
@@ -947,6 +1016,7 @@ static int venus_sys_set_default_properties(struct venus_hfi_device *hdev)
 {
 	struct device *dev = hdev->core->dev;
 	const struct venus_resources *res = hdev->core->res;
+	bool fw_low_power = venus_fw_low_power_mode && !IS_IRIS1(hdev->core);
 	int ret;
 
 	ret = venus_sys_set_debug(hdev, venus_fw_debug);
@@ -960,10 +1030,15 @@ static int venus_sys_set_default_properties(struct venus_hfi_device *hdev)
 			dev_warn(dev, "setting idle response ON failed (%d)\n", ret);
 	}
 
-	ret = venus_sys_set_power_control(hdev, venus_fw_low_power_mode);
+	/*
+	 * IRIS1 keeps the video/CVP domains in software control. Do not
+	 * advertise autonomous power collapse without the matching GDSC
+	 * handoff. Host PC_PREP and secure runtime suspend remain separate.
+	 */
+	ret = venus_sys_set_power_control(hdev, fw_low_power);
 	if (ret)
-		dev_warn(dev, "setting hw power collapse ON failed (%d)\n",
-			 ret);
+		dev_warn(dev, "setting hw power collapse %s failed (%d)\n",
+			 fw_low_power ? "ON" : "OFF", ret);
 
 	/* For specific venus core, it is mandatory to set the UBWC configuration */
 	if (res->ubwc_conf) {
@@ -1218,6 +1293,42 @@ static int venus_core_trigger_ssr(struct venus_core *core, u32 trigger_type)
 		return ret;
 
 	return venus_iface_cmdq_write(hdev, &pkt, false);
+}
+
+/* Only used after a failed IRIS1 session-init wait, never to change state. */
+void venus_hfi_session_init_timeout(struct venus_core *core)
+{
+	struct venus_hfi_device *hdev = to_hfi_priv(core);
+	struct hfi_queue_header *qhdr;
+	unsigned int i;
+
+	if (!IS_IRIS1(core) || !hdev)
+		return;
+
+	mutex_lock(&hdev->lock);
+	dev_err_ratelimited(core->dev,
+			    "IRIS1 session-init timeout: state=%u powered=%u suspended=%u\n",
+			    hdev->state, hdev->power_enabled, hdev->suspended);
+
+	if (hdev->power_enabled && !hdev->suspended)
+		dev_err_ratelimited(core->dev,
+				    "IRIS1 status: ctrl=%#x cpu=%#x irq=%#x mask=%#x\n",
+				    readl(core->cpu_cs_base + CPU_CS_SCIACMDARG0),
+				    readl(core->wrapper_base + WRAPPER_CPU_STATUS),
+				    readl(core->wrapper_base + WRAPPER_INTR_STATUS),
+				    readl(core->wrapper_base + WRAPPER_INTR_MASK));
+
+	/* Firmware may update these fields while this snapshot is read. */
+	for (i = IFACEQ_CMD_IDX; i <= IFACEQ_MSG_IDX; i++) {
+		qhdr = hdev->queues[i].qhdr;
+		if (!qhdr)
+			continue;
+		dev_err_ratelimited(core->dev,
+				    "IRIS1 q%u: rd=%u wr=%u rx_req=%u tx_req=%u\n", i,
+				    READ_ONCE(qhdr->read_idx), READ_ONCE(qhdr->write_idx),
+				    READ_ONCE(qhdr->rx_req), READ_ONCE(qhdr->tx_req));
+	}
+	mutex_unlock(&hdev->lock);
 }
 
 static int venus_session_init(struct venus_inst *inst, u32 session_type,

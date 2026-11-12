@@ -982,12 +982,21 @@ MODULE_DEVICE_TABLE(of, dispcc_sm7150_match_table);
 static int dispcc_sm7150_probe(struct platform_device *pdev)
 {
 	struct regmap *regmap;
+	u32 mode;
 
 	regmap = qcom_cc_map(pdev, &dispcc_sm7150_desc);
 	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 
-	clk_fabia_pll_configure(&dispcc_pll0, regmap, &dispcc_pll0_config);
+	/*
+	 * Not a PLL the bootloader left locked and running: the panel is scanning out its boot picture from it, and
+	 * reprogramming it under the display flashed the LCD white (no picture) until the panel was set up again.
+	 */
+	regmap_read(regmap, dispcc_pll0.offset, &mode);
+	if ((mode & (BIT(31) | BIT(0))) != (BIT(31) | BIT(0)))
+		clk_fabia_pll_configure(&dispcc_pll0, regmap, &dispcc_pll0_config);
+	else
+		dev_info(&pdev->dev, "display PLL0 left running as the bootloader set it\n");
 	/* Enable clock gating for DSI and MDP clocks */
 	regmap_update_bits(regmap, 0x8000, 0x7f0, 0x7f0);
 

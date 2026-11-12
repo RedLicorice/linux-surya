@@ -7,7 +7,6 @@
  * Contact: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
  *	    Sakari Ailus <sakari.ailus@iki.fi>
  */
-#define DEBUG
 #include <linux/export.h>
 #include <linux/ioctl.h>
 #include <linux/leds.h>

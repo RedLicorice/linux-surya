@@ -5,6 +5,9 @@
  */
 
 #include <linux/fb.h>
+#include <linux/io.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
 
 #include <drm/drm_drv.h>
 #include <drm/drm_crtc_helper.h>
@@ -86,6 +89,48 @@ static const struct drm_fb_helper_funcs msm_fbdev_helper_funcs = {
 	.fb_dirty = msm_fbdev_fb_dirty,
 };
 
+/*
+ * Start the console framebuffer with the picture the bootloader left on the panel (the /reserved-memory
+ * splash_region it scans out, XRGB8888 rows of width * 4 bytes). The first modeset resets the panel, and a
+ * zeroed buffer then put a black screen up between the boot logo and the boot splash; on an LCD at the
+ * bootloader's brightness that black glows, and it read as a bright flash.
+ */
+static void msm_fbdev_copy_splash(struct drm_device *dev, struct drm_framebuffer *fb, void *vaddr)
+{
+	struct device_node *rmem, *np;
+	struct resource res;
+	unsigned int row, rows, len;
+	void *splash;
+
+	if (fb->format->format != DRM_FORMAT_XRGB8888 && fb->format->format != DRM_FORMAT_ARGB8888)
+		return;
+
+	rmem = of_find_node_by_path("/reserved-memory");
+	if (!rmem)
+		return;
+	for_each_child_of_node(rmem, np)
+		if (of_node_name_prefix(np, "splash_region"))
+			break;
+	of_node_put(rmem);
+	if (!np)
+		return;
+	if (of_address_to_resource(np, 0, &res)) {
+		of_node_put(np);
+		return;
+	}
+	of_node_put(np);
+
+	len = fb->width * 4;
+	rows = min_t(u64, fb->height, resource_size(&res) / len);
+	splash = memremap(res.start, (size_t)rows * len, MEMREMAP_WC);
+	if (!splash)
+		return;
+	for (row = 0; row < rows; row++)
+		memcpy(vaddr + row * fb->pitches[0], splash + row * len, len);
+	memunmap(splash);
+	DRM_DEV_INFO(dev->dev, "fbdev starts with the bootloader's splash (%u rows)\n", rows);
+}
+
 int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 				 struct drm_fb_helper_surface_size *sizes)
 {
@@ -140,6 +185,7 @@ int msm_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
 		ret = PTR_ERR(fbi->screen_buffer);
 		goto fail;
 	}
+	msm_fbdev_copy_splash(dev, fb, fbi->screen_buffer);
 	fbi->screen_size = bo->size;
 	fbi->fix.smem_start = paddr;
 	fbi->fix.smem_len = bo->size;
