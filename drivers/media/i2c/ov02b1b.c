@@ -5,8 +5,10 @@
  * There is no public datasheet and no public driver. The init table was decoded from the phone's
  * CamX sensor module (com.qti.sensormodule.j20c_ofilm_ov02b1b_depth.bin): the module lists the
  * register addresses in one array and the values in another, in the same order. The chip is a
- * sibling of the OV02A10 (same 0xfd page register, same 0x02/0x03 chip id registers, same
- * trigger register 0x01 on page 1), so its exposure and gain registers follow that family.
+ * sibling of the OV02A10 (same 0xfd page register, same 0x02/0x03 chip id registers). The
+ * exposure and gain registers and their latch (0xfe = 2 on page 1, not the OV02A10's 0x01) come
+ * from the vendor sensor library (com.qti.sensor.ofilm_ov02b1b.so) and were checked on the phone:
+ * written values read back unchanged until the latch.
  * Registers and values are 8 bit; 0xfd selects the page.
  *
  * 1600x1200 RAW10, one lane, 66.56 MHz pixel clock, 30 fps (line 1792, frame 1236).
@@ -30,7 +32,12 @@
 #define OV02B1B_REG_CHIP_ID		CCI_REG16(0x02)	/* page 0 */
 #define OV02B1B_CHIP_ID			0x002b
 #define OV02B1B_REG_PAGE		CCI_REG8(0xfd)
-#define OV02B1B_REG_TRIGGER		CCI_REG8(0x01)	/* page 1: latch the exposure and gain */
+/*
+ * page 1: 2 latches the exposure and gain written since the last latch (the vendor sensor
+ * library ends every exposure update with it; without it the values stay in shadow registers)
+ */
+#define OV02B1B_REG_TRIGGER		CCI_REG8(0xfe)
+#define OV02B1B_TRIGGER_LATCH		0x02
 #define OV02B1B_REG_EXPOSURE		CCI_REG16(0x0e)	/* page 1, in lines */
 #define OV02B1B_REG_GAIN		CCI_REG8(0x22)	/* page 1: 0x10 = 1x */
 
@@ -216,11 +223,11 @@ static int ov02b1b_set_ctrl(struct v4l2_ctrl *ctrl)
 	switch (ctrl->id) {
 	case V4L2_CID_EXPOSURE:
 		ov02b1b_write_page(ov, 0x01, OV02B1B_REG_EXPOSURE, ctrl->val, &ret);
-		cci_write(ov->regmap, OV02B1B_REG_TRIGGER, 0x01, &ret);
+		cci_write(ov->regmap, OV02B1B_REG_TRIGGER, OV02B1B_TRIGGER_LATCH, &ret);
 		break;
 	case V4L2_CID_ANALOGUE_GAIN:
 		ov02b1b_write_page(ov, 0x01, OV02B1B_REG_GAIN, ctrl->val >> 2, &ret);
-		cci_write(ov->regmap, OV02B1B_REG_TRIGGER, 0x01, &ret);
+		cci_write(ov->regmap, OV02B1B_REG_TRIGGER, OV02B1B_TRIGGER_LATCH, &ret);
 		break;
 	default:
 		break;
@@ -307,7 +314,7 @@ static int ov02b1b_enable_streams(struct v4l2_subdev *sd, struct v4l2_subdev_sta
 		ov02b1b_write_page(ov, stream_page, CCI_REG8(stream_reg), stream_on, &ret);
 	if (!ret) {
 		cci_write(ov->regmap, OV02B1B_REG_PAGE, 0x01, &ret);
-		cci_write(ov->regmap, OV02B1B_REG_TRIGGER, 0x01, &ret);
+		cci_write(ov->regmap, OV02B1B_REG_TRIGGER, OV02B1B_TRIGGER_LATCH, &ret);
 	}
 	if (ret) {
 		dev_err(ov->dev, "failed to start streaming: %d\n", ret);
