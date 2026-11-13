@@ -423,6 +423,16 @@ config VIDEO_OV01A10
 	  To compile this driver as a module, choose M here: the
 	  module will be called ov01a10.
 
+config VIDEO_OV02B1B
+	tristate "OmniVision OV02B1B sensor support"
+	select V4L2_CCI_I2C
+	help
+	  This is a Video4Linux2 sensor driver for the OmniVision
+	  OV02B1B 2MP camera (the depth camera of the POCO X3 NFC).
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called ov02b1b.
+
 config VIDEO_OV02A10
 	tristate "OmniVision OV02A10 sensor support"
 	help

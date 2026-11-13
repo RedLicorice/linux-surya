@@ -224,7 +224,7 @@ Status of the cameras:
 | Front      | Samsung S5K3T2            | CSIPHY1, D-PHY, behind the CAM_SEL mux      | working |
 | Macro      | SK Hynix Hi-259           | CSIPHY2, combo mode (data lane 2, clock 3)  | working |
 | Ultrawide  | SK Hynix Hi-1337          | CSIPHY1, behind the CAM_SEL mux             | working (4208x3120, and 2096x1560 at 60 fps) |
-| Depth      | OmniVision OV02B1B        |                                             | no driver |
+| Depth      | OmniVision OV02B1B        | CSIPHY2, D-PHY, 1 lane (lane 0, clock 1)    | streams 1600x1200 (init table from the CamX module; exposure and gain controls untuned) |
 
 ### CAMSS: every SM7150 CSIPHY needs `csiphy0_clk`
 

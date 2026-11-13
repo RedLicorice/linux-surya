@@ -151,6 +151,8 @@ struct camss_async_subdev {
 	struct camss_camera_interface interface;
 };
 
+struct csiphy_csi2_cfg *camss_sensor_csi2_cfg(struct camss *camss, struct v4l2_subdev *sensor);
+
 struct camss_clock {
 	struct clk *clk;
 	const char *name;

@@ -1,0 +1,8 @@
+# Cross toolchain for building the POCO X3 NFC (surya) kernel pieces on an x86-64 host.
+# Debian trixie ships gcc 14.2, the compiler the phone's 7.2.15-surya kernel was built with.
+FROM docker.io/library/debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu gcc make flex bison bc \
+        libssl-dev libelf-dev dwarves python3 perl kmod cpio rsync xz-utils ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src

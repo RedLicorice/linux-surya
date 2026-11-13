@@ -26,6 +26,20 @@
 		mux-gpios = <&pm6150_gpios 3 GPIO_ACTIVE_HIGH>;
 	};
 
+	/* depth camera I/O supply: CAM_2M_DEPTH_IOVDD1P8_EN, a load switch on the 1.8 V rail */
+	vreg_depth_iovdd: regulator-depth-iovdd {
+		compatible = "regulator-fixed";
+		regulator-name = "depth_iovdd";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+
+		gpio = <&pm6150_gpios 4 GPIO_ACTIVE_HIGH>;
+		startup-delay-us = <1000>;
+		enable-active-high;
+
+		vin-supply = <&vreg_l13a_1p8>;
+	};
+
 	vreg_wide_ldo_avdd2: regulator-wide-ldo-avdd2 {
 		compatible = "regulator-fixed";
 		regulator-name = "wide_ldo_avdd2";
@@ -306,7 +320,37 @@
 };
 
 &cci0_i2c1 {
-	/* OmniVision ov02b1b Depth @ 3c (8-bit 0x78) */
+	/*
+	 * Depth 2MP (OmniVision OV02B1B, D-PHY, 1 lane on CSIPHY2, shared with the macro camera:
+	 * the depth camera is on lanes 0-1, the macro on 2-3). 8-bit address 0x78 in the CamX
+	 * module. Its MCLK is the front camera's (MCLK0, the front driver sets the pin up).
+	 */
+	camera@3c {
+		compatible = "ovti,ov02b1b";
+		reg = <0x3c>;
+
+		reset-gpios = <&tlmm 93 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_depth_default>;
+
+		orientation = <1>;	/* back */
+		rotation = <270>;
+
+		clocks = <&camcc CAMCC_MCLK0_CLK>;
+		assigned-clocks = <&camcc CAMCC_MCLK0_CLK>;
+		assigned-clock-rates = <19200000>;
+
+		dovdd-supply = <&vreg_depth_iovdd>;
+		avdd-supply = <&cam_avdd1>;
+
+		port {
+			ov02b1b_ep: endpoint {
+				remote-endpoint = <&csiphy2_depth_ep>;
+				data-lanes = <0>;
+				link-frequencies = /bits/ 64 <332800000>;
+			};
+		};
+	};
 
 	/*
 	 * Front 20MP camera (S5K3T2, D-PHY, 4 lanes on CSIPHY1). The factory DT puts it on
@@ -444,16 +488,30 @@
 		};
 
 		port@2 {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
 			/*
 			 * Combo mode, as the vendor CamX module sets it up (laneAssign 0x2, isComboMode 1):
 			 * CSIPHY2 is shared with the depth camera on lanes 0-1, the macro sends on data
-			 * lane 2 with its clock on lane 3.
+			 * lane 2 with its clock on lane 3. The sensors take turns (the link of the one
+			 * that streams is enabled), each with its own lanes.
 			 */
-			csiphy2_ep: endpoint {
+			csiphy2_ep: endpoint@0 {
+				reg = <0>;
 				clock-lanes = <3>;
 				data-lanes = <2>;
 				bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
 				remote-endpoint = <&hi259_ep>;
+			};
+
+			/* depth: data lane 0 and the first clock lane (not combo mode) */
+			csiphy2_depth_ep: endpoint@1 {
+				reg = <1>;
+				clock-lanes = <7>;
+				data-lanes = <0>;
+				bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
+				remote-endpoint = <&ov02b1b_ep>;
 			};
 		};
 	};
@@ -506,6 +564,14 @@
 			drive-strength = <2>;
 			bias-disable;
 		};
+	};
+
+	/* depth reset (gpio93) */
+	cam_depth_default: cam-depth-default-state {
+		pins = "gpio93";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
 	};
 
 	cam_mclk2_default: cam-mclk2-default-state {

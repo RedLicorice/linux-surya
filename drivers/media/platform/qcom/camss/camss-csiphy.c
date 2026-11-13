@@ -722,6 +722,16 @@ static int csiphy_link_setup(struct media_entity *entity,
 			     const struct media_pad *local,
 			     const struct media_pad *remote, u32 flags)
 {
+	if ((local->flags & MEDIA_PAD_FL_SINK) && (flags & MEDIA_LNK_FL_ENABLED)) {
+		struct csiphy_device *csiphy = v4l2_get_subdevdata(media_entity_to_v4l2_subdev(entity));
+		struct csiphy_csi2_cfg *cfg;
+
+		/* the sensor that gets the PHY brings its own lane configuration */
+		cfg = camss_sensor_csi2_cfg(csiphy->camss, media_entity_to_v4l2_subdev(remote->entity));
+		if (cfg)
+			csiphy->cfg.csi2 = cfg;
+	}
+
 	if ((local->flags & MEDIA_PAD_FL_SOURCE) &&
 	    (flags & MEDIA_LNK_FL_ENABLED)) {
 		struct v4l2_subdev *sd;

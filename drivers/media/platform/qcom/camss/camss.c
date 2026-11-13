@@ -5426,6 +5426,23 @@ static int camss_subdev_notifier_bound(struct v4l2_async_notifier *async,
 	return 0;
 }
 
+/*
+ * camss_sensor_csi2_cfg - The CSI-2 configuration the device tree gives a sensor
+ *
+ * Sensors that share a CSIPHY (surya: the macro and the depth camera, each on its own lane pair)
+ * do not have the same lanes, so the PHY takes the configuration of the sensor it is linked to.
+ */
+struct csiphy_csi2_cfg *camss_sensor_csi2_cfg(struct camss *camss, struct v4l2_subdev *sensor)
+{
+	struct v4l2_async_connection *asc;
+
+	list_for_each_entry(asc, &camss->notifier.done_list, asc_entry) {
+		if (asc->sd == sensor)
+			return &container_of(asc, struct camss_async_subdev, asd)->interface.csi2;
+	}
+	return NULL;
+}
+
 static int camss_subdev_notifier_complete(struct v4l2_async_notifier *async)
 {
 	struct camss *camss = container_of(async, struct camss, notifier);
@@ -5477,6 +5494,12 @@ static int camss_subdev_notifier_complete(struct v4l2_async_notifier *async)
 				flags = MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED;
 
 			ret = media_create_pad_link(sensor, i, input, MSM_CSIPHY_PAD_SINK, flags);
+			if (!ret && (flags & MEDIA_LNK_FL_ENABLED)) {
+				struct csiphy_csi2_cfg *cfg = camss_sensor_csi2_cfg(camss, sd);
+
+				if (cfg)
+					csiphy->cfg.csi2 = cfg;
+			}
 		}
 		if (ret < 0) {
 			camss_link_err(camss, sensor->name, input->name, ret);
