@@ -123,6 +123,7 @@ enum qcom_scm_qseecom_tz_cmd_app {
 	QSEECOM_TZ_CMD_APP_SEND			= 1,
 	QSEECOM_TZ_CMD_APP_SHUTDOWN		= 2,
 	QSEECOM_TZ_CMD_APP_LOOKUP		= 3,
+	QSEECOM_TZ_CMD_SERVICES_IMAGE_LOAD	= 7,
 };
 
 enum qcom_scm_qseecom_tz_cmd_listener {
@@ -2577,6 +2578,58 @@ int qcom_scm_qseecom_app_load(void *img, size_t mdt_len, size_t img_len,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_load);
+
+/**
+ * qcom_scm_qseecom_services_image_load() - Load a QSEE services image.
+ * @img:     TZ memory holding the image, laid out as for
+ *           qcom_scm_qseecom_app_load().
+ * @mdt_len: Length of the metadata part, or zero for a single-file image.
+ * @img_len: Total length of the image.
+ *
+ * Loads a shared library that applications link against, such as the 32-bit
+ * cmnlib a 32-bit application needs. Android's qseecom driver does this on
+ * the first load of a 32-bit application (TZ_OS_LOAD_SERVICES_IMAGE_ID). The
+ * arguments are the same as for APP_START; no application ID is returned.
+ *
+ * Return: Zero on success, nonzero on failure.
+ */
+int qcom_scm_qseecom_services_image_load(void *img, size_t mdt_len,
+					 size_t img_len)
+{
+	struct qcom_scm_qseecom_resp res = {};
+	struct qcom_scm_desc desc = {};
+	phys_addr_t img_phys;
+	int status;
+
+	if (!img || !img_len || mdt_len > img_len)
+		return -EINVAL;
+
+	img_phys = qcom_tzmem_to_phys(img);
+	if (!img_phys)
+		return -EINVAL;
+
+	desc.owner = QSEECOM_TZ_OWNER_QSEE_OS;
+	desc.svc = QSEECOM_TZ_SVC_APP_MGR;
+	desc.cmd = QSEECOM_TZ_CMD_SERVICES_IMAGE_LOAD;
+	desc.arginfo = QCOM_SCM_ARGS(3);
+	desc.args[0] = mdt_len;
+	desc.args[1] = img_len;
+	desc.args[2] = img_phys;
+
+	status = qcom_scm_qseecom_call(&desc, &res);
+	if (status)
+		return status;
+
+	if (res.result != QSEECOM_RESULT_SUCCESS) {
+		dev_dbg(__scm->dev,
+			"qseecom: services image load rejected: result %llu, type %llu, data %llu\n",
+			res.result, res.resp_type, res.data);
+		return -EIO;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qcom_scm_qseecom_services_image_load);
 
 /**
  * qcom_scm_qseecom_app_shutdown() - Unload a QSEE application.

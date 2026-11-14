@@ -29,6 +29,7 @@
 
 #include <linux/capability.h>
 #include <linux/cleanup.h>
+#include <linux/elf.h>
 #include <linux/errno.h>
 #include <linux/firmware.h>
 #include <linux/list.h>
@@ -148,6 +149,8 @@ struct qseecom_tee {
 	struct mutex apps_lock;
 	u32 next_app_gen;
 	struct list_head apps;
+	struct mutex cmnlib_lock;
+	bool cmnlib_loaded;
 };
 
 /**
@@ -1439,18 +1442,59 @@ static void qseecom_tee_supp_release(struct tee_context *ctx)
  * ordinary client should be able to do, and answering "who may load" with
  * "whoever can open /dev/teepriv0" needs no policy of its own.
  */
-static int qseecom_tee_supp_load_app(struct tee_context *ctx,
-				     struct tee_ioctl_open_session_arg *arg,
-				     struct tee_param *param)
+static int qseecom_tee_load_image(struct qseecom_tee *qtee, const char *name,
+				  bool services, u32 *app_id);
+
+/*
+ * A 32-bit application links against cmnlib, the 32-bit QSEE common library,
+ * which TZ only has once someone loaded it as a services image. On Android
+ * the qseecom driver does that on the first 32-bit application load; a boot
+ * stage may have loaded the 64-bit cmnlib64 already, but that does not cover
+ * a 32-bit application.
+ *
+ * A failure here is reported but not fatal: some earlier stage may have
+ * loaded cmnlib already, and then the application load that follows is the
+ * real test. It is retried on the next 32-bit load until it succeeds.
+ */
+static void qseecom_tee_load_cmnlib(struct qseecom_tee *qtee)
 {
-	u32 app_gen = 0;
-	struct qseecom_tee_context *ctxdata = ctx->data;
-	struct qseecom_tee *qtee = ctxdata->qtee;
+	int ret;
+
+	guard(mutex)(&qtee->cmnlib_lock);
+
+	if (qtee->cmnlib_loaded)
+		return;
+
+	ret = qseecom_tee_load_image(qtee, "cmnlib", true, NULL);
+	if (ret) {
+		dev_warn(qtee->dev,
+			 "could not load cmnlib: %d; 32-bit applications may not load\n",
+			 ret);
+		return;
+	}
+
+	qtee->cmnlib_loaded = true;
+	dev_info(qtee->dev, "loaded cmnlib\n");
+}
+
+static bool qseecom_tee_fw_is_elf32(const struct firmware *fw)
+{
+	return fw->size >= EI_NIDENT && !memcmp(fw->data, ELFMAG, SELFMAG) &&
+	       fw->data[EI_CLASS] == ELFCLASS32;
+}
+
+/*
+ * Fetch @name from the firmware search path, stage it in TZ memory and hand
+ * it to TZ, either as an application (returning its ID in @app_id) or as a
+ * services image (@services, @app_id unused).
+ */
+static int qseecom_tee_load_image(struct qseecom_tee *qtee, const char *name,
+				  bool services, u32 *app_id)
+{
 	struct qcom_tzmem_pool_config pool_config = {
 		.policy = QCOM_TZMEM_POLICY_STATIC,
 	};
 	char fw_name[QSEECOM_TEE_MAX_APP_NAME + sizeof(".mdt")];
-	char app_name[QSEECOM_TEE_MAX_APP_NAME];
 	size_t img_len, mdt_len, stage_len;
 	phys_addr_t stage_phys, img_phys;
 	const struct firmware *fw;
@@ -1458,25 +1502,21 @@ static int qseecom_tee_supp_load_app(struct tee_context *ctx,
 	bool split;
 	ssize_t len;
 	struct qcom_tzmem_pool *pool;
-	u32 app_id;
 	int ret;
 
-	if (arg->num_params != 1)
-		return -EINVAL;
-
-	ret = qseecom_tee_get_app_name(&param[0], app_name, sizeof(app_name));
-	if (ret)
-		return ret;
-
-	snprintf(fw_name, sizeof(fw_name), "%s.mdt", app_name);
+	snprintf(fw_name, sizeof(fw_name), "%s.mdt", name);
 	ret = firmware_request_nowarn(&fw, fw_name, qtee->dev);
 	split = !ret;
 	if (ret == -ENOENT) {
-		snprintf(fw_name, sizeof(fw_name), "%s.mbn", app_name);
+		snprintf(fw_name, sizeof(fw_name), "%s.mbn", name);
 		ret = request_firmware(&fw, fw_name, qtee->dev);
 	}
 	if (ret)
 		return ret;
+
+	/* Both forms start with the ELF header: the .mdt is its first part. */
+	if (!services && qseecom_tee_fw_is_elf32(fw))
+		qseecom_tee_load_cmnlib(qtee);
 
 	if (split) {
 		len = qcom_mdt_get_image_size(fw);
@@ -1543,14 +1583,40 @@ static int qseecom_tee_supp_load_app(struct tee_context *ctx,
 
 	if (len < 0)
 		ret = len;
+	else if (services)
+		ret = qcom_scm_qseecom_services_image_load(aligned, mdt_len,
+							   img_len);
 	else
 		ret = qcom_scm_qseecom_app_load(aligned, mdt_len, img_len,
-						&app_id);
+						app_id);
 
 	qcom_tzmem_free(stage);
 	qcom_tzmem_pool_free(pool);
-	release_firmware(fw);
 
+out_release:
+	release_firmware(fw);
+	return ret;
+}
+
+static int qseecom_tee_supp_load_app(struct tee_context *ctx,
+				     struct tee_ioctl_open_session_arg *arg,
+				     struct tee_param *param)
+{
+	u32 app_gen = 0;
+	struct qseecom_tee_context *ctxdata = ctx->data;
+	struct qseecom_tee *qtee = ctxdata->qtee;
+	char app_name[QSEECOM_TEE_MAX_APP_NAME];
+	u32 app_id;
+	int ret;
+
+	if (arg->num_params != 1)
+		return -EINVAL;
+
+	ret = qseecom_tee_get_app_name(&param[0], app_name, sizeof(app_name));
+	if (ret)
+		return ret;
+
+	ret = qseecom_tee_load_image(qtee, app_name, false, &app_id);
 	if (ret) {
 		dev_warn(qtee->dev, "failed to load '%s': %d\n", app_name, ret);
 		return ret;
@@ -1583,10 +1649,6 @@ static int qseecom_tee_supp_load_app(struct tee_context *ctx,
 	arg->ret_origin = 0;
 
 	return 0;
-
-out_release:
-	release_firmware(fw);
-	return ret;
 
 err_shutdown:
 	if (qcom_scm_qseecom_app_shutdown(app_id))
@@ -1844,6 +1906,10 @@ static int qseecom_tee_probe(struct platform_device *pdev)
 		return ret;
 
 	ret = devm_mutex_init(dev, &qtee->apps_lock);
+	if (ret)
+		return ret;
+
+	ret = devm_mutex_init(dev, &qtee->cmnlib_lock);
 	if (ret)
 		return ret;
 
