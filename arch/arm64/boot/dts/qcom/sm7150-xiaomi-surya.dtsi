@@ -26,6 +26,28 @@
 		mux-gpios = <&pm6150_gpios 3 GPIO_ACTIVE_HIGH>;
 	};
 
+	/*
+	 * Side fingerprint sensor. The board is dual-sourced (Goodix or FPC) on the same
+	 * reset/interrupt pins; its SPI bus (gpio59-62, qup10) belongs to TrustZone, so only
+	 * supply, reset and interrupt are described. The Goodix part number is not known yet:
+	 * gf3626 is the closest compatible the driver takes (it is part-agnostic) until the
+	 * trusted app reports the chip id. Goodix runs from L7C, FPC from L8C (see below).
+	 */
+	fingerprint {
+		compatible = "goodix,gf3626";
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <89 IRQ_TYPE_EDGE_RISING>;
+
+		reset-gpios = <&tlmm 90 GPIO_ACTIVE_LOW>;
+		vdd-supply = <&vreg_l7c_3p0>;
+
+		firmware-name = "goodixfp";
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&fp_int_default>, <&fp_reset_default>;
+	};
+
 	/* depth camera I/O supply: CAM_2M_DEPTH_IOVDD1P8_EN, a load switch on the 1.8 V rail */
 	vreg_depth_iovdd: regulator-depth-iovdd {
 		compatible = "regulator-fixed";
@@ -590,6 +612,22 @@
 	};
 };
 
+&tlmm {
+	fp_int_default: fp-int-default-state {
+		pins = "gpio89";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	fp_reset_default: fp-reset-default-state {
+		pins = "gpio90";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+};
+
 &gpu {
 	zap-shader {
 		firmware-name = "qcom/sm7150/xiaomi/surya/a615_zap.mbn";
@@ -1094,6 +1132,14 @@
 		opp-hz = /bits/ 64 <192000000>;
 		required-opps = <&rpmhpd_opp_low_svs>;
 	};
+};
+
+/*
+ * FPC fingerprint supply (vcc_spi/vdd_io/vdd_ana downstream). Always on as downstream has
+ * it, so the FPC trusted app can find its sensor on FPC-sourced boards without a driver.
+ */
+&vreg_l8c_1p8 {
+	regulator-always-on;
 };
 
 &vreg_l18a_2p8 {
