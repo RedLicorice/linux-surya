@@ -29,12 +29,12 @@
 	/*
 	 * Side fingerprint sensor. The board is dual-sourced (Goodix or FPC) on the same
 	 * reset/interrupt pins; its SPI bus (gpio59-62, qup10) belongs to TrustZone, so only
-	 * supply, reset and interrupt are described. The Goodix part number is not known yet:
-	 * gf3626 is the closest compatible the driver takes (it is part-agnostic) until the
-	 * trusted app reports the chip id. Goodix runs from L7C, FPC from L8C (see below).
+	 * supply, reset and interrupt are described. This node is the Goodix part, which the
+	 * goodixfp trusted app reports as GF_CHIP_316M (Milan family); FPC-sourced boards
+	 * (supply L8C) are not supported yet.
 	 */
 	fingerprint {
-		compatible = "goodix,gf3626";
+		compatible = "goodix,gf316m";
 
 		interrupt-parent = <&tlmm>;
 		interrupts = <89 IRQ_TYPE_EDGE_RISING>;
@@ -1132,14 +1132,6 @@
 		opp-hz = /bits/ 64 <192000000>;
 		required-opps = <&rpmhpd_opp_low_svs>;
 	};
-};
-
-/*
- * FPC fingerprint supply (vcc_spi/vdd_io/vdd_ana downstream). Always on as downstream has
- * it, so the FPC trusted app can find its sensor on FPC-sourced boards without a driver.
- */
-&vreg_l8c_1p8 {
-	regulator-always-on;
 };
 
 &vreg_l18a_2p8 {
