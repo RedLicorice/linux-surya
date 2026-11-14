@@ -628,6 +628,14 @@
 	};
 };
 
+/*
+ * Stage QSEE application images in the region downstream gives its QSECOM ION
+ * heap, rather than in megabytes of CMA (see drivers/tee/qseecom).
+ */
+&{/firmware/scm} {
+	qcom,qseecom-memory-region = <&qseecom_mem>;
+};
+
 &gpu {
 	zap-shader {
 		firmware-name = "qcom/sm7150/xiaomi/surya/a615_zap.mbn";

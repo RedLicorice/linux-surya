@@ -32,9 +32,12 @@
 #include <linux/elf.h>
 #include <linux/errno.h>
 #include <linux/firmware.h>
+#include <linux/io.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
@@ -138,6 +141,13 @@ struct qseecom_tee_supp {
  * @apps:        Applications this driver loaded, since TZ will not resolve
  *               them by name afterwards.
  * @supp:        Supplicant state.
+ * @carveout:    Write-combined mapping of the region the SCM node names in
+ *               qcom,qseecom-memory-region, if any. Images are staged at its
+ *               start, one at a time (see qseecom_tee_load_image()). NULL
+ *               without one.
+ * @carveout_phys: Physical base of @carveout.
+ * @carveout_size: Size of @carveout.
+ * @carveout_lock: Serialises image staging in @carveout.
  */
 struct qseecom_tee {
 	struct device *dev;
@@ -151,6 +161,10 @@ struct qseecom_tee {
 	struct list_head apps;
 	struct mutex cmnlib_lock;
 	bool cmnlib_loaded;
+	void *carveout;
+	phys_addr_t carveout_phys;
+	size_t carveout_size;
+	struct mutex carveout_lock;
 };
 
 /**
@@ -1484,6 +1498,101 @@ static bool qseecom_tee_fw_is_elf32(const struct firmware *fw)
 }
 
 /*
+ * Stage an image at the first 4 MiB aligned address of the carveout and hand
+ * it to TZ by physical address. This is what Android's qseecom driver does: it
+ * stages images in its QSECOM ION heap, which is this region. TZ copies the
+ * image into its own application region during the load, so the carveout is
+ * free again as soon as the call returns.
+ *
+ * Unlike a fresh contiguous allocation of about nine megabytes, which CMA
+ * refuses under memory pressure, the carveout is reserved at boot and a load
+ * cannot fail for want of memory.
+ *
+ * Return: -ENODEV when there is no carveout or the image does not fit, so the
+ * caller falls back to TZ memory; otherwise the result of the load.
+ */
+static int qseecom_tee_load_carveout(struct qseecom_tee *qtee,
+				     const struct firmware *fw,
+				     const char *fw_name, bool split,
+				     size_t mdt_len, size_t img_len,
+				     bool services, u32 *app_id)
+{
+	phys_addr_t img_phys;
+	void *img;
+	ssize_t len;
+
+	if (!qtee->carveout)
+		return -ENODEV;
+
+	img_phys = ALIGN(qtee->carveout_phys, QSEECOM_TEE_IMAGE_ALIGN);
+	if (img_phys - qtee->carveout_phys + img_len > qtee->carveout_size)
+		return -ENODEV;
+
+	img = qtee->carveout + (img_phys - qtee->carveout_phys);
+
+	guard(mutex)(&qtee->carveout_lock);
+
+	if (split) {
+		len = qcom_mdt_read_image(qtee->dev, fw, fw_name, img, img_len);
+		if (len < 0)
+			return len;
+	} else {
+		memcpy(img, fw->data, img_len);
+	}
+
+	/* The mapping is write-combined: drain it before TZ reads the image. */
+	wmb();
+
+	if (services)
+		return qcom_scm_qseecom_services_image_load_phys(img_phys,
+								 mdt_len,
+								 img_len);
+
+	return qcom_scm_qseecom_app_load_phys(img_phys, mdt_len, img_len,
+					      app_id);
+}
+
+/*
+ * Map the region the SCM node names in qcom,qseecom-memory-region, if it names
+ * one. Without the property images are staged in TZ memory as before.
+ */
+static int qseecom_tee_carveout_init(struct qseecom_tee *qtee)
+{
+	struct device *dev = qtee->dev;
+	struct device_node *np;
+	struct reserved_mem *rmem;
+	void *va;
+
+	if (!dev->parent || !dev->parent->of_node)
+		return 0;
+
+	np = of_parse_phandle(dev->parent->of_node,
+			      "qcom,qseecom-memory-region", 0);
+	if (!np)
+		return 0;
+
+	rmem = of_reserved_mem_lookup(np);
+	of_node_put(np);
+	if (!rmem)
+		return dev_err_probe(dev, -EINVAL,
+				     "qseecom memory region is not reserved memory\n");
+
+	va = devm_memremap(dev, rmem->base, rmem->size, MEMREMAP_WC);
+	if (IS_ERR(va))
+		return dev_err_probe(dev, PTR_ERR(va),
+				     "cannot map the qseecom memory region\n");
+
+	qtee->carveout = va;
+	qtee->carveout_phys = rmem->base;
+	qtee->carveout_size = rmem->size;
+
+	dev_info(dev, "staging application images in %pa+%pa\n",
+		 &rmem->base, &rmem->size);
+
+	return 0;
+}
+
+/*
  * Fetch @name from the firmware search path, stage it in TZ memory and hand
  * it to TZ, either as an application (returning its ID in @app_id) or as a
  * services image (@services, @app_id unused).
@@ -1537,8 +1646,14 @@ static int qseecom_tee_load_image(struct qseecom_tee *qtee, const char *name,
 
 	img_len = len;
 
+	ret = qseecom_tee_load_carveout(qtee, fw, fw_name, split, mdt_len,
+					img_len, services, app_id);
+	if (ret != -ENODEV)
+		goto out_release;
+
 	/*
-	 * Stage the image through a pool of its own rather than the shared one.
+	 * Without a carveout, stage the image through a pool of its own rather
+	 * than the shared one.
 	 * Two reasons, and both were learned the hard way:
 	 *
 	 * TZ maps the image itself and wants it at a 4 MiB aligned physical
@@ -1913,6 +2028,10 @@ static int qseecom_tee_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	ret = devm_mutex_init(dev, &qtee->carveout_lock);
+	if (ret)
+		return ret;
+
 	init_waitqueue_head(&qtee->supp.wq);
 	INIT_LIST_HEAD(&qtee->apps);
 
@@ -1920,6 +2039,10 @@ static int qseecom_tee_probe(struct platform_device *pdev)
 	if (IS_ERR(qtee->mempool))
 		return dev_err_probe(dev, PTR_ERR(qtee->mempool),
 				     "failed to create TZ memory pool\n");
+
+	ret = qseecom_tee_carveout_init(qtee);
+	if (ret)
+		return ret;
 
 	qtee->pool = qseecom_tee_pool_new();
 	if (IS_ERR(qtee->pool))
