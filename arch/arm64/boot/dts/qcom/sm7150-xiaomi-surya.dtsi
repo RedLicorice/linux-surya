@@ -628,6 +628,14 @@
 	};
 };
 
+/*
+ * QSEE here only takes application buffers from the region downstream gives its
+ * QSECOM ION heap, so stage them there (see drivers/tee/qseecom).
+ */
+&{/firmware/scm} {
+	qcom,qseecom-memory-region = <&qseecom_mem>;
+};
+
 &gpu {
 	zap-shader {
 		firmware-name = "qcom/sm7150/xiaomi/surya/a615_zap.mbn";

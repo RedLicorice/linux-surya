@@ -2686,14 +2686,37 @@ EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_shutdown);
 int qcom_scm_qseecom_app_send(u32 app_id, void *req, size_t req_size,
 			      void *rsp, size_t rsp_size)
 {
+	return qcom_scm_qseecom_app_send_phys(app_id,
+					      qcom_tzmem_to_phys(req), req_size,
+					      qcom_tzmem_to_phys(rsp), rsp_size);
+}
+EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_send);
+
+/**
+ * qcom_scm_qseecom_app_send_phys() - As qcom_scm_qseecom_app_send(), with the
+ * buffers given by physical address.
+ * @app_id:   The ID of the target app.
+ * @req_phys: Physical address of the request buffer.
+ * @req_size: Size of the request buffer.
+ * @rsp_phys: Physical address of the response buffer.
+ * @rsp_size: Size of the response buffer.
+ *
+ * For buffers that do not come from the TZ memory allocator: some firmware
+ * only accepts application buffers from a carveout it was told about, which
+ * the caller maps itself.
+ *
+ * Return: Zero on success, nonzero on failure.
+ */
+int qcom_scm_qseecom_app_send_phys(u32 app_id, phys_addr_t req_phys,
+				   size_t req_size, phys_addr_t rsp_phys,
+				   size_t rsp_size)
+{
 	struct qcom_scm_qseecom_resp res = {};
 	struct qcom_scm_desc desc = {};
-	phys_addr_t req_phys;
-	phys_addr_t rsp_phys;
 	int status;
 
-	req_phys = qcom_tzmem_to_phys(req);
-	rsp_phys = qcom_tzmem_to_phys(rsp);
+	if (!req_phys || !rsp_phys)
+		return -EINVAL;
 
 	desc.owner = QSEECOM_TZ_OWNER_TZ_APPS;
 	desc.svc = QSEECOM_TZ_SVC_APP_ID_PLACEHOLDER;
@@ -2716,7 +2739,7 @@ int qcom_scm_qseecom_app_send(u32 app_id, void *req, size_t req_size,
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_send);
+EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_send_phys);
 
 /*
  * We do not yet support re-entrant calls via the qseecom interface. To prevent

@@ -32,9 +32,13 @@
 #include <linux/elf.h>
 #include <linux/errno.h>
 #include <linux/firmware.h>
+#include <linux/genalloc.h>
+#include <linux/io.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
@@ -145,6 +149,7 @@ struct qseecom_tee {
 	struct tee_device *supp_teedev;
 	struct tee_shm_pool *pool;
 	struct qcom_tzmem_pool *mempool;
+	struct gen_pool *carveout;
 	struct qseecom_tee_supp supp;
 	struct mutex apps_lock;
 	u32 next_app_gen;
@@ -731,6 +736,22 @@ static int qseecom_tee_memref(struct tee_param *param, u32 want, void **va,
 }
 
 /*
+ * Physical address of a staging buffer, as TZ is to be told it: from the
+ * carveout when there is one, otherwise from the TZ memory allocator. Zero
+ * when the address is not one of ours.
+ */
+static phys_addr_t qseecom_tee_stage_phys(struct qseecom_tee *qtee, void *va)
+{
+	phys_addr_t pa;
+
+	if (!qtee->carveout)
+		return qcom_tzmem_to_phys(va);
+
+	pa = gen_pool_virt_to_phys(qtee->carveout, (unsigned long)va);
+	return pa == (phys_addr_t)-1 ? 0 : pa;
+}
+
+/*
  * Patch the physical address of a buffer into the request.
  *
  * Some applications are not handed everything in the request buffer. They are
@@ -800,6 +821,7 @@ static int qseecom_tee_invoke_func(struct tee_context *ctx,
 				   struct tee_param *param)
 {
 	struct qseecom_tee_context *ctxdata = ctx->data;
+	struct qseecom_tee *qtee = ctxdata->qtee;
 	struct qseecom_tee_session *sess;
 	size_t req_size, rsp_size;
 	u32 app_gen;
@@ -860,7 +882,7 @@ static int qseecom_tee_invoke_func(struct tee_context *ctx,
 		struct qcom_tzmem_pool_config bc = {
 			.policy = QCOM_TZMEM_POLICY_STATIC,
 		};
-		struct qcom_tzmem_pool *bp;
+		struct qcom_tzmem_pool *bp = NULL;
 		size_t need, off;
 		void *b;
 		unsigned int k;
@@ -888,14 +910,21 @@ static int qseecom_tee_invoke_func(struct tee_context *ctx,
 		bc.initial_size = PAGE_ALIGN(need) + PAGE_SIZE;
 		bc.max_size = bc.initial_size;
 
-		bp = qcom_tzmem_pool_new(&bc);
-		if (IS_ERR(bp))
-			return PTR_ERR(bp);
+		if (qtee->carveout) {
+			b = (void *)gen_pool_alloc(qtee->carveout,
+						   bc.initial_size);
+			if (!b)
+				return -ENOMEM;
+		} else {
+			bp = qcom_tzmem_pool_new(&bc);
+			if (IS_ERR(bp))
+				return PTR_ERR(bp);
 
-		b = qcom_tzmem_alloc(bp, bc.initial_size, GFP_KERNEL);
-		if (!b) {
-			qcom_tzmem_pool_free(bp);
-			return -ENOMEM;
+			b = qcom_tzmem_alloc(bp, bc.initial_size, GFP_KERNEL);
+			if (!b) {
+				qcom_tzmem_pool_free(bp);
+				return -ENOMEM;
+			}
 		}
 
 		memset(b, 0, bc.initial_size);
@@ -927,7 +956,7 @@ static int qseecom_tee_invoke_func(struct tee_context *ctx,
 			}
 
 			memcpy(b + off, pv, plen);
-			pp = qcom_tzmem_to_phys(b + off);
+			pp = qseecom_tee_stage_phys(qtee, b + off);
 			if (!pp) {
 				ret = -EINVAL;
 				goto out_free;
@@ -952,8 +981,17 @@ static int qseecom_tee_invoke_func(struct tee_context *ctx,
 			off += plen;
 		}
 
-		ret = qcom_scm_qseecom_app_send(app_id, b, req_size,
-						b + req_size, rsp_size);
+		if (qtee->carveout) {
+			/* Write-combined: drain before TZ reads it. */
+			wmb();
+			ret = qcom_scm_qseecom_app_send_phys(app_id,
+					qseecom_tee_stage_phys(qtee, b), req_size,
+					qseecom_tee_stage_phys(qtee, b + req_size),
+					rsp_size);
+		} else {
+			ret = qcom_scm_qseecom_app_send(app_id, b, req_size,
+							b + req_size, rsp_size);
+		}
 		if (!ret) {
 			memcpy(rsp, b + req_size, rsp_size);
 
@@ -972,8 +1010,13 @@ static int qseecom_tee_invoke_func(struct tee_context *ctx,
 		}
 
 out_free:
-		qcom_tzmem_free(b);
-		qcom_tzmem_pool_free(bp);
+		if (qtee->carveout) {
+			gen_pool_free(qtee->carveout, (unsigned long)b,
+				      bc.initial_size);
+		} else {
+			qcom_tzmem_free(b);
+			qcom_tzmem_pool_free(bp);
+		}
 
 		if (ret)
 			return ret;
@@ -1884,6 +1927,59 @@ static const struct tee_desc qseecom_tee_supp_desc = {
 	.flags = TEE_DESC_PRIVILEGED,
 };
 
+/*
+ * Optional carveout for the buffers an application is sent.
+ *
+ * Downstream, libQSEEComAPI allocates a client's shared buffer, and vendor
+ * clients their command payloads, from the QSECOM ION heap: a no-map
+ * reserved region the downstream qseecom node names in memory-region. Some
+ * QSEE builds (SM7150, QSEE 0x1400000) refuse an application send whose
+ * buffers lie anywhere else, with an SCM-level -EINVAL. The SCM node names
+ * that region in qcom,qseecom-memory-region; when it does, request,
+ * response and patched buffers are staged there instead of in TZ memory.
+ */
+static int qseecom_tee_carveout_init(struct qseecom_tee *qtee)
+{
+	struct device *dev = qtee->dev;
+	struct device_node *np;
+	struct reserved_mem *rmem;
+	void *va;
+	int ret;
+
+	if (!dev->parent || !dev->parent->of_node)
+		return 0;
+
+	np = of_parse_phandle(dev->parent->of_node,
+			      "qcom,qseecom-memory-region", 0);
+	if (!np)
+		return 0;
+
+	rmem = of_reserved_mem_lookup(np);
+	of_node_put(np);
+	if (!rmem)
+		return dev_err_probe(dev, -EINVAL,
+				     "qseecom memory region is not reserved\n");
+
+	va = devm_memremap(dev, rmem->base, rmem->size, MEMREMAP_WC);
+	if (IS_ERR(va))
+		return dev_err_probe(dev, PTR_ERR(va),
+				     "cannot map the qseecom memory region\n");
+
+	qtee->carveout = devm_gen_pool_create(dev, PAGE_SHIFT, -1, NULL);
+	if (IS_ERR(qtee->carveout))
+		return PTR_ERR(qtee->carveout);
+
+	ret = gen_pool_add_virt(qtee->carveout, (unsigned long)va, rmem->base,
+				rmem->size, -1);
+	if (ret)
+		return ret;
+
+	dev_info(dev, "staging application buffers in %pa+%pa\n",
+		 &rmem->base, &rmem->size);
+
+	return 0;
+}
+
 static int qseecom_tee_probe(struct platform_device *pdev)
 {
 	struct qcom_tzmem_pool_config pool_config = {
@@ -1920,6 +2016,10 @@ static int qseecom_tee_probe(struct platform_device *pdev)
 	if (IS_ERR(qtee->mempool))
 		return dev_err_probe(dev, PTR_ERR(qtee->mempool),
 				     "failed to create TZ memory pool\n");
+
+	ret = qseecom_tee_carveout_init(qtee);
+	if (ret)
+		return ret;
 
 	qtee->pool = qseecom_tee_pool_new();
 	if (IS_ERR(qtee->pool))

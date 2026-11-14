@@ -228,6 +228,9 @@ int qcom_scm_qseecom_listener_register(struct qcom_scm_qseecom_listener *listene
 int qcom_scm_qseecom_listener_unregister(struct qcom_scm_qseecom_listener *listener);
 int qcom_scm_qseecom_app_send(u32 app_id, void *req, size_t req_size,
 			      void *rsp, size_t rsp_size);
+int qcom_scm_qseecom_app_send_phys(u32 app_id, phys_addr_t req_phys,
+				   size_t req_size, phys_addr_t rsp_phys,
+				   size_t rsp_size);
 
 #else /* CONFIG_QCOM_QSEECOM */
 
@@ -257,6 +260,15 @@ static inline int qcom_scm_qseecom_app_shutdown(u32 app_id)
 static inline int qcom_scm_qseecom_app_send(u32 app_id,
 					    void *req, size_t req_size,
 					    void *rsp, size_t rsp_size)
+{
+	return -EINVAL;
+}
+
+static inline int qcom_scm_qseecom_app_send_phys(u32 app_id,
+						 phys_addr_t req_phys,
+						 size_t req_size,
+						 phys_addr_t rsp_phys,
+						 size_t rsp_size)
 {
 	return -EINVAL;
 }
