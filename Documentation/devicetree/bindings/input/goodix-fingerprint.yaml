@@ -23,7 +23,9 @@ description: >
 
 properties:
   compatible:
-    const: goodix,gf3626
+    enum:
+      - goodix,gf316m
+      - goodix,gf3626
 
   interrupts:
     maxItems: 1

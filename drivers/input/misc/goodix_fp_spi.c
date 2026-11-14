@@ -643,6 +643,7 @@ static struct attribute *gf_attrs[] = {
 ATTRIBUTE_GROUPS(gf);
 
 static const struct of_device_id gf_of_match[] = {
+	{ .compatible = "goodix,gf316m" },
 	{ .compatible = "goodix,gf3626" },
 	{}
 };
