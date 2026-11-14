@@ -96,11 +96,11 @@ static int send_mode;
 module_param(send_mode, int, 0644);
 MODULE_PARM_DESC(send_mode, "0 legacy send, 1 whitelist send, 2 whitelist with empty table");
 
-static bool use_carveout = true;
+static bool use_carveout;
 module_param(use_carveout, bool, 0644);
 MODULE_PARM_DESC(use_carveout, "Stage sends in the qseecom carveout when the DT names one");
 
-static bool lookup_check = true;
+static bool lookup_check;
 module_param(lookup_check, bool, 0644);
 MODULE_PARM_DESC(lookup_check, "Look the application up by name before each send and log it");
 
