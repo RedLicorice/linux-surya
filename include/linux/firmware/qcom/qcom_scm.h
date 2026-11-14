@@ -223,6 +223,10 @@ int qcom_scm_qseecom_app_load(void *img, size_t mdt_len, size_t img_len,
 			      u32 *app_id);
 int qcom_scm_qseecom_services_image_load(void *img, size_t mdt_len,
 					 size_t img_len);
+int qcom_scm_qseecom_app_load_phys(phys_addr_t img_phys, size_t mdt_len,
+				   size_t img_len, u32 *app_id);
+int qcom_scm_qseecom_services_image_load_phys(phys_addr_t img_phys,
+					      size_t mdt_len, size_t img_len);
 int qcom_scm_qseecom_app_shutdown(u32 app_id);
 int qcom_scm_qseecom_listener_register(struct qcom_scm_qseecom_listener *listener);
 int qcom_scm_qseecom_listener_unregister(struct qcom_scm_qseecom_listener *listener);
@@ -245,6 +249,20 @@ static inline int qcom_scm_qseecom_app_load(void *img, size_t mdt_len,
 static inline int qcom_scm_qseecom_services_image_load(void *img,
 						       size_t mdt_len,
 						       size_t img_len)
+{
+	return -EINVAL;
+}
+
+static inline int qcom_scm_qseecom_app_load_phys(phys_addr_t img_phys,
+						 size_t mdt_len,
+						 size_t img_len, u32 *app_id)
+{
+	return -EINVAL;
+}
+
+static inline int qcom_scm_qseecom_services_image_load_phys(phys_addr_t img_phys,
+							    size_t mdt_len,
+							    size_t img_len)
 {
 	return -EINVAL;
 }

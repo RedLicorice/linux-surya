@@ -2550,12 +2550,43 @@ EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_get_id);
 int qcom_scm_qseecom_app_load(void *img, size_t mdt_len, size_t img_len,
 			      u32 *app_id)
 {
+	phys_addr_t img_phys;
+
+	if (!img)
+		return -EINVAL;
+
+	img_phys = qcom_tzmem_to_phys(img);
+	if (!img_phys)
+		return -EINVAL;
+
+	return qcom_scm_qseecom_app_load_phys(img_phys, mdt_len, img_len,
+					      app_id);
+}
+EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_load);
+
+/**
+ * qcom_scm_qseecom_app_load_phys() - Load a QSEE app from an image at a
+ *                                    physical address.
+ * @img_phys: Physical address of the image, laid out as for
+ *            qcom_scm_qseecom_app_load().
+ * @mdt_len:  Length of the .mdt metadata, or zero for a single-file image.
+ * @img_len:  Total length of the image.
+ * @app_id:   Out: ID of the newly loaded app.
+ *
+ * As qcom_scm_qseecom_app_load(), for an image the caller staged outside TZ
+ * memory, such as in a carveout reserved for QSEE (downstream's QSECOM heap).
+ * The caller is responsible for the image being visible to the secure world.
+ *
+ * Return: Zero on success, nonzero on failure.
+ */
+int qcom_scm_qseecom_app_load_phys(phys_addr_t img_phys, size_t mdt_len,
+				   size_t img_len, u32 *app_id)
+{
 	struct qcom_scm_qseecom_resp res = {};
 	struct qcom_scm_desc desc = {};
-	phys_addr_t img_phys;
 	int status;
 
-	if (!img || !img_len || mdt_len > img_len)
+	if (!img_phys || !img_len || mdt_len > img_len)
 		return -EINVAL;
 
 	desc.owner = QSEECOM_TZ_OWNER_QSEE_OS;
@@ -2569,10 +2600,6 @@ int qcom_scm_qseecom_app_load(void *img, size_t mdt_len, size_t img_len,
 	desc.arginfo = QCOM_SCM_ARGS(3);
 	desc.args[0] = mdt_len;
 	desc.args[1] = img_len;
-	img_phys = qcom_tzmem_to_phys(img);
-	if (!img_phys)
-		return -EINVAL;
-
 	desc.args[2] = img_phys;
 
 	status = qcom_scm_qseecom_call(&desc, &res);
@@ -2593,7 +2620,7 @@ int qcom_scm_qseecom_app_load(void *img, size_t mdt_len, size_t img_len,
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_load);
+EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_load_phys);
 
 /**
  * qcom_scm_qseecom_services_image_load() - Load a QSEE services image.
@@ -2612,16 +2639,38 @@ EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_load);
 int qcom_scm_qseecom_services_image_load(void *img, size_t mdt_len,
 					 size_t img_len)
 {
-	struct qcom_scm_qseecom_resp res = {};
-	struct qcom_scm_desc desc = {};
 	phys_addr_t img_phys;
-	int status;
 
-	if (!img || !img_len || mdt_len > img_len)
+	if (!img)
 		return -EINVAL;
 
 	img_phys = qcom_tzmem_to_phys(img);
 	if (!img_phys)
+		return -EINVAL;
+
+	return qcom_scm_qseecom_services_image_load_phys(img_phys, mdt_len,
+							 img_len);
+}
+EXPORT_SYMBOL_GPL(qcom_scm_qseecom_services_image_load);
+
+/**
+ * qcom_scm_qseecom_services_image_load_phys() - Load a QSEE services image
+ *                                               at a physical address.
+ * @img_phys: Physical address of the image, as for
+ *            qcom_scm_qseecom_app_load_phys().
+ * @mdt_len:  Length of the metadata part, or zero for a single-file image.
+ * @img_len:  Total length of the image.
+ *
+ * Return: Zero on success, nonzero on failure.
+ */
+int qcom_scm_qseecom_services_image_load_phys(phys_addr_t img_phys,
+					      size_t mdt_len, size_t img_len)
+{
+	struct qcom_scm_qseecom_resp res = {};
+	struct qcom_scm_desc desc = {};
+	int status;
+
+	if (!img_phys || !img_len || mdt_len > img_len)
 		return -EINVAL;
 
 	desc.owner = QSEECOM_TZ_OWNER_QSEE_OS;
@@ -2645,7 +2694,7 @@ int qcom_scm_qseecom_services_image_load(void *img, size_t mdt_len,
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(qcom_scm_qseecom_services_image_load);
+EXPORT_SYMBOL_GPL(qcom_scm_qseecom_services_image_load_phys);
 
 /**
  * qcom_scm_qseecom_app_shutdown() - Unload a QSEE application.
