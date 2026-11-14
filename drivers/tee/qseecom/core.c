@@ -85,6 +85,36 @@
 #define QSEECOM_TEE_MAX_PATCH		4
 
 /*
+ * Bring-up switches, writable at runtime under
+ * /sys/module/qseecomtee/parameters/ so one boot can try every variant.
+ *
+ * send_mode: 0 = legacy send (cmd 1); 1 = whitelist send (cmd 6) with one
+ * sglist entry per patched buffer, as Android's qseecom builds it; 2 =
+ * whitelist send with an all-zero sglist table.
+ */
+static int send_mode;
+module_param(send_mode, int, 0644);
+MODULE_PARM_DESC(send_mode, "0 legacy send, 1 whitelist send, 2 whitelist with empty table");
+
+static bool use_carveout = true;
+module_param(use_carveout, bool, 0644);
+MODULE_PARM_DESC(use_carveout, "Stage sends in the qseecom carveout when the DT names one");
+
+static bool lookup_check = true;
+module_param(lookup_check, bool, 0644);
+MODULE_PARM_DESC(lookup_check, "Look the application up by name before each send and log it");
+
+/* Downstream's struct sglist_info and SGLISTINFO_TABLE_SIZE (MAX_ION_FD 4). */
+struct qseecom_tee_sglist_info {
+	__le32 index_and_flags;
+	__le32 size_or_count;
+};
+
+#define QSEECOM_TEE_SGL_SINGLE		BIT(31)
+#define QSEECOM_TEE_SGL_64BIT		BIT(30)
+#define QSEECOM_TEE_SGL_TABLE_SIZE	(4 * sizeof(struct qseecom_tee_sglist_info))
+
+/*
  * How long to wait for a supplicant to answer before giving up on it. An
  * application is blocked in the secure world for this whole time, and so is
  * every other QSEECOM user, so it cannot be generous. Answering late is not
@@ -514,6 +544,23 @@ static bool qseecom_tee_app_current(struct qseecom_tee *qtee, u32 app_id,
 	return false;
 }
 
+/* Debug: copy out the name an application id was loaded under, if ours. */
+static bool qseecom_tee_app_name(struct qseecom_tee *qtee, u32 app_id,
+				 char *name, size_t len)
+{
+	struct qseecom_tee_app *app;
+
+	guard(mutex)(&qtee->apps_lock);
+
+	list_for_each_entry(app, &qtee->apps, node)
+		if (app->app_id == app_id) {
+			strscpy(name, app->name, len);
+			return true;
+		}
+
+	return false;
+}
+
 static int qseecom_tee_app_remember(struct qseecom_tee *qtee, const char *name,
 				    u32 app_id, u32 *gen)
 {
@@ -740,11 +787,12 @@ static int qseecom_tee_memref(struct tee_param *param, u32 want, void **va,
  * carveout when there is one, otherwise from the TZ memory allocator. Zero
  * when the address is not one of ours.
  */
-static phys_addr_t qseecom_tee_stage_phys(struct qseecom_tee *qtee, void *va)
+static phys_addr_t qseecom_tee_stage_phys(struct qseecom_tee *qtee, bool cv,
+					  void *va)
 {
 	phys_addr_t pa;
 
-	if (!qtee->carveout)
+	if (!cv)
 		return qcom_tzmem_to_phys(va);
 
 	pa = gen_pool_virt_to_phys(qtee->carveout, (unsigned long)va);
@@ -883,6 +931,9 @@ static int qseecom_tee_invoke_func(struct tee_context *ctx,
 			.policy = QCOM_TZMEM_POLICY_STATIC,
 		};
 		struct qcom_tzmem_pool *bp = NULL;
+		struct qseecom_tee_sglist_info *sgl;
+		bool cv = qtee->carveout && use_carveout;
+		int mode = READ_ONCE(send_mode);
 		size_t need, off;
 		void *b;
 		unsigned int k;
@@ -907,10 +958,11 @@ static int qseecom_tee_invoke_func(struct tee_context *ctx,
 		if (need < req_size || need > QSEECOM_TEE_MAX_XFER)
 			return -EINVAL;
 
-		bc.initial_size = PAGE_ALIGN(need) + PAGE_SIZE;
+		/* One spare page for patch padding, one for the sglist table. */
+		bc.initial_size = PAGE_ALIGN(need) + 2 * PAGE_SIZE;
 		bc.max_size = bc.initial_size;
 
-		if (qtee->carveout) {
+		if (cv) {
 			b = (void *)gen_pool_alloc(qtee->carveout,
 						   bc.initial_size);
 			if (!b)
@@ -956,10 +1008,20 @@ static int qseecom_tee_invoke_func(struct tee_context *ctx,
 			}
 
 			memcpy(b + off, pv, plen);
-			pp = qseecom_tee_stage_phys(qtee, b + off);
+			pp = qseecom_tee_stage_phys(qtee, cv, b + off);
 			if (!pp) {
 				ret = -EINVAL;
 				goto out_free;
+			}
+
+			/* Downstream __qseecom_update_cmd_buf(), nents == 1. */
+			sgl = b + bc.initial_size - PAGE_SIZE;
+			if (mode == 1) {
+				sgl[(k - 2) / 2].index_and_flags =
+					cpu_to_le32(QSEECOM_TEE_SGL_SINGLE |
+						    (pw == 8 ? QSEECOM_TEE_SGL_64BIT : 0) |
+						    (poff & 0x3fffffff));
+				sgl[(k - 2) / 2].size_or_count = cpu_to_le32(plen);
 			}
 
 			/*
@@ -981,17 +1043,39 @@ static int qseecom_tee_invoke_func(struct tee_context *ctx,
 			off += plen;
 		}
 
-		if (qtee->carveout) {
-			/* Write-combined: drain before TZ reads it. */
-			wmb();
-			ret = qcom_scm_qseecom_app_send_phys(app_id,
-					qseecom_tee_stage_phys(qtee, b), req_size,
-					qseecom_tee_stage_phys(qtee, b + req_size),
-					rsp_size);
-		} else {
-			ret = qcom_scm_qseecom_app_send(app_id, b, req_size,
-							b + req_size, rsp_size);
+		if (lookup_check) {
+			char name[QSEECOM_TEE_MAX_APP_NAME];
+			u32 found_id = 0;
+			int lret = -ENOENT;
+
+			if (qseecom_tee_app_name(qtee, app_id, name, sizeof(name)))
+				lret = qcom_scm_qseecom_app_get_id(name, &found_id);
+			else
+				name[0] = '\0';
+			dev_info(qtee->dev,
+				 "send: app %u '%s' lookup ret %d id %u, mode %d, %s, req %zu rsp %zu patches %u\n",
+				 app_id, name, lret, found_id, mode,
+				 cv ? "carveout" : "tzmem", req_size, rsp_size,
+				 (arg->num_params - 2) / 2);
 		}
+
+		sgl = b + bc.initial_size - PAGE_SIZE;
+
+		/* Write-combined carveout: drain before TZ reads it. */
+		wmb();
+		if (mode == 1 || mode == 2)
+			ret = qcom_scm_qseecom_app_send_wl_phys(app_id,
+					qseecom_tee_stage_phys(qtee, cv, b), req_size,
+					qseecom_tee_stage_phys(qtee, cv, b + req_size),
+					rsp_size,
+					qseecom_tee_stage_phys(qtee, cv, sgl),
+					QSEECOM_TEE_SGL_TABLE_SIZE);
+		else
+			ret = qcom_scm_qseecom_app_send_phys(app_id,
+					qseecom_tee_stage_phys(qtee, cv, b), req_size,
+					qseecom_tee_stage_phys(qtee, cv, b + req_size),
+					rsp_size);
+		dev_info(qtee->dev, "send: app %u ret %d\n", app_id, ret);
 		if (!ret) {
 			memcpy(rsp, b + req_size, rsp_size);
 
@@ -1010,7 +1094,7 @@ static int qseecom_tee_invoke_func(struct tee_context *ctx,
 		}
 
 out_free:
-		if (qtee->carveout) {
+		if (cv) {
 			gen_pool_free(qtee->carveout, (unsigned long)b,
 				      bc.initial_size);
 		} else {

@@ -123,6 +123,7 @@ enum qcom_scm_qseecom_tz_cmd_app {
 	QSEECOM_TZ_CMD_APP_SEND			= 1,
 	QSEECOM_TZ_CMD_APP_SHUTDOWN		= 2,
 	QSEECOM_TZ_CMD_APP_LOOKUP		= 3,
+	QSEECOM_TZ_CMD_APP_SEND_WHITELIST	= 6,
 	QSEECOM_TZ_CMD_SERVICES_IMAGE_LOAD	= 7,
 };
 
@@ -2304,7 +2305,12 @@ static int qcom_scm_qseecom_call(const struct qcom_scm_desc *desc,
 		res->resp_type, res->data);
 
 	if (status) {
-		dev_err(__scm->dev, "qseecom: scm call failed with error %d\n", status);
+		dev_err(__scm->dev,
+			"qseecom: scm call failed with error %d (owner=%u svc=%u cmd=%u arginfo=%#x args=%llx %llx %llx %llx %llx %llx %llx)\n",
+			status, desc->owner, desc->svc, desc->cmd, desc->arginfo,
+			desc->args[0], desc->args[1], desc->args[2],
+			desc->args[3], desc->args[4], desc->args[5],
+			desc->args[6]);
 		return status;
 	}
 
@@ -2426,11 +2432,10 @@ EXPORT_SYMBOL_GPL(qcom_scm_qseecom_listener_unregister);
  *
  * Return: Zero on success, nonzero on failure.
  */
-static int qcom_scm_qseecom_get_version(u32 *version)
+static int qcom_scm_qseecom_get_feat_version(u32 feature, u32 *version)
 {
 	struct qcom_scm_desc desc = {};
 	struct qcom_scm_qseecom_resp res = {};
-	u32 feature = 10;
 	int ret;
 
 	desc.owner = QSEECOM_TZ_OWNER_SIP;
@@ -2445,6 +2450,11 @@ static int qcom_scm_qseecom_get_version(u32 *version)
 
 	*version = res.result;
 	return 0;
+}
+
+static int qcom_scm_qseecom_get_version(u32 *version)
+{
+	return qcom_scm_qseecom_get_feat_version(10, version);
 }
 
 /**
@@ -2741,6 +2751,62 @@ int qcom_scm_qseecom_app_send_phys(u32 app_id, phys_addr_t req_phys,
 }
 EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_send_phys);
 
+/**
+ * qcom_scm_qseecom_app_send_wl_phys() - As qcom_scm_qseecom_app_send_phys(),
+ * using the whitelist form of the send.
+ * @app_id:   The ID of the target app.
+ * @req_phys: Physical address of the request buffer.
+ * @req_size: Size of the request buffer.
+ * @rsp_phys: Physical address of the response buffer.
+ * @rsp_size: Size of the response buffer.
+ * @sgl_phys: Physical address of the sglist info table.
+ * @sgl_size: Size of the sglist info table.
+ *
+ * QSEE with the whitelist feature (feature id 15) takes a table naming every
+ * buffer whose physical address is patched into the request, so the
+ * application may only reach those. Android's qseecom driver uses this form
+ * for every application send when the feature is present.
+ *
+ * Return: Zero on success, nonzero on failure.
+ */
+int qcom_scm_qseecom_app_send_wl_phys(u32 app_id, phys_addr_t req_phys,
+				      size_t req_size, phys_addr_t rsp_phys,
+				      size_t rsp_size, phys_addr_t sgl_phys,
+				      size_t sgl_size)
+{
+	struct qcom_scm_qseecom_resp res = {};
+	struct qcom_scm_desc desc = {};
+	int status;
+
+	if (!req_phys || !rsp_phys || !sgl_phys)
+		return -EINVAL;
+
+	desc.owner = QSEECOM_TZ_OWNER_TZ_APPS;
+	desc.svc = QSEECOM_TZ_SVC_APP_ID_PLACEHOLDER;
+	desc.cmd = QSEECOM_TZ_CMD_APP_SEND_WHITELIST;
+	desc.arginfo = QCOM_SCM_ARGS(7, QCOM_SCM_VAL,
+				     QCOM_SCM_RW, QCOM_SCM_VAL,
+				     QCOM_SCM_RW, QCOM_SCM_VAL,
+				     QCOM_SCM_RW, QCOM_SCM_VAL);
+	desc.args[0] = app_id;
+	desc.args[1] = req_phys;
+	desc.args[2] = req_size;
+	desc.args[3] = rsp_phys;
+	desc.args[4] = rsp_size;
+	desc.args[5] = sgl_phys;
+	desc.args[6] = sgl_size;
+
+	status = qcom_scm_qseecom_call(&desc, &res);
+	if (status)
+		return status;
+
+	if (res.result != QSEECOM_RESULT_SUCCESS)
+		return -EIO;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qcom_scm_qseecom_app_send_wl_phys);
+
 /*
  * We do not yet support re-entrant calls via the qseecom interface. To prevent
  + any potential issues with this, only allow validated machines for now.
@@ -2839,6 +2905,14 @@ static int qcom_scm_qseecom_init(struct qcom_scm *scm)
 		return 0;
 
 	dev_info(scm->dev, "qseecom: found qseecom with version 0x%x\n", version);
+
+	{
+		u32 wl = 0;
+		int wret = qcom_scm_qseecom_get_feat_version(15, &wl);
+
+		dev_info(scm->dev, "qseecom: whitelist feature version 0x%x (ret %d)\n",
+			 wl, wret);
+	}
 
 	/*
 	 * QSEE older than TZ.BF.4.0 takes the address of an application image
