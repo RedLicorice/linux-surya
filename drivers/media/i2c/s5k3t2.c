@@ -59,7 +59,11 @@
  * dark indoors: a fixed 4x gives it the headroom (8x brought out column lines and noise).
  */
 #define S5K3T2_REG_DGAIN	0x020e
-#define S5K3T2_DGAIN_FIXED	0x0400
+
+/* Read at each stream start, so it can be changed through /sys/module/s5k3t2/parameters/dgain */
+static unsigned int dgain = 0x0400;
+module_param(dgain, uint, 0644);
+MODULE_PARM_DESC(dgain, "global digital gain, 0x0100 = 1x (default 0x0400)");
 
 /* Input clock rate */
 #define S5K3T2_INCLK_RATE	19200000
@@ -1193,7 +1197,7 @@ static int s5k3t2_start_streaming(struct s5k3t2 *s5k3t2)
 	 * green and magenta grid on the S5K3T2.
 	 */
 	for (u16 reg = S5K3T2_REG_DGAIN; reg <= S5K3T2_REG_DGAIN + 6; reg += 2) {
-		ret = s5k3t2_write_reg(s5k3t2, reg, 2, S5K3T2_DGAIN_FIXED);
+		ret = s5k3t2_write_reg(s5k3t2, reg, 2, clamp(dgain, 0x0100U, 0x0fffU));
 		if (ret) {
 			dev_err(s5k3t2->dev, "fail to set the digital gain");
 			return ret;
