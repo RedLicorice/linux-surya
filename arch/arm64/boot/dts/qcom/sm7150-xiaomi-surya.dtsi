@@ -26,6 +26,28 @@
 		mux-gpios = <&pm6150_gpios 3 GPIO_ACTIVE_HIGH>;
 	};
 
+	/*
+	 * Side fingerprint sensor. The board is dual-sourced (Goodix or FPC) on the same
+	 * reset/interrupt pins; its SPI bus (gpio59-62, qup10) belongs to TrustZone, so only
+	 * supply, reset and interrupt are described. This node is the Goodix part, which the
+	 * goodixfp trusted app reports as GF_CHIP_316M (Milan family); FPC-sourced boards
+	 * (supply L8C) are not supported yet.
+	 */
+	fingerprint {
+		compatible = "goodix,gf316m";
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <89 IRQ_TYPE_EDGE_RISING>;
+
+		reset-gpios = <&tlmm 90 GPIO_ACTIVE_LOW>;
+		vdd-supply = <&vreg_l7c_3p0>;
+
+		firmware-name = "goodixfp";
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&fp_int_default>, <&fp_reset_default>;
+	};
+
 	/* depth camera I/O supply: CAM_2M_DEPTH_IOVDD1P8_EN, a load switch on the 1.8 V rail */
 	vreg_depth_iovdd: regulator-depth-iovdd {
 		compatible = "regulator-fixed";
@@ -584,6 +606,22 @@
 	/* macro reset (gpio64) and CHIP_EN (gpio57) */
 	cam_macro_default: cam-macro-default-state {
 		pins = "gpio57", "gpio64";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+};
+
+&tlmm {
+	fp_int_default: fp-int-default-state {
+		pins = "gpio89";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	fp_reset_default: fp-reset-default-state {
+		pins = "gpio90";
 		function = "gpio";
 		drive-strength = <2>;
 		bias-disable;
