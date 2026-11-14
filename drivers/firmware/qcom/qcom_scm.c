@@ -2417,20 +2417,21 @@ int qcom_scm_qseecom_listener_unregister(struct qcom_scm_qseecom_listener *liste
 }
 EXPORT_SYMBOL_GPL(qcom_scm_qseecom_listener_unregister);
 
+/* Feature ids for QSEECOM_TZ_CMD_INFO_VERSION, as downstream names them. */
+#define QSEECOM_FEATURE_VERSION		10
+#define QSEECOM_FEATURE_WHITELIST	15
+
 /**
- * qcom_scm_qseecom_get_version() - Query the QSEECOM version.
- * @version: Pointer where the QSEECOM version will be stored.
- *
- * Performs the QSEECOM SCM querying the QSEECOM version currently running in
- * the TrustZone.
+ * qcom_scm_qseecom_get_feat_version() - Query the version of a QSEE feature.
+ * @feature: Feature id.
+ * @version: Pointer where the feature version will be stored.
  *
  * Return: Zero on success, nonzero on failure.
  */
-static int qcom_scm_qseecom_get_version(u32 *version)
+static int qcom_scm_qseecom_get_feat_version(u32 feature, u32 *version)
 {
 	struct qcom_scm_desc desc = {};
 	struct qcom_scm_qseecom_resp res = {};
-	u32 feature = 10;
 	int ret;
 
 	desc.owner = QSEECOM_TZ_OWNER_SIP;
@@ -2445,6 +2446,21 @@ static int qcom_scm_qseecom_get_version(u32 *version)
 
 	*version = res.result;
 	return 0;
+}
+
+/**
+ * qcom_scm_qseecom_get_version() - Query the QSEECOM version.
+ * @version: Pointer where the QSEECOM version will be stored.
+ *
+ * Performs the QSEECOM SCM querying the QSEECOM version currently running in
+ * the TrustZone.
+ *
+ * Return: Zero on success, nonzero on failure.
+ */
+static int qcom_scm_qseecom_get_version(u32 *version)
+{
+	return qcom_scm_qseecom_get_feat_version(QSEECOM_FEATURE_VERSION,
+						 version);
 }
 
 /**
@@ -2816,6 +2832,21 @@ static int qcom_scm_qseecom_init(struct qcom_scm *scm)
 		return 0;
 
 	dev_info(scm->dev, "qseecom: found qseecom with version 0x%x\n", version);
+
+	/*
+	 * Ask for the whitelist feature version, as Android's qseecom driver
+	 * does at probe. The answer itself is not needed, but on SM7150
+	 * (QSEE 0x1400000) TZ rejects every APP_SEND with EINVAL until this
+	 * query has been made once in the boot; with it, the plain send works.
+	 */
+	{
+		u32 wl_version = 0;
+
+		ret = qcom_scm_qseecom_get_feat_version(QSEECOM_FEATURE_WHITELIST,
+							&wl_version);
+		dev_dbg(scm->dev, "qseecom: whitelist feature version 0x%x (%d)\n",
+			wl_version, ret);
+	}
 
 	/*
 	 * QSEE older than TZ.BF.4.0 takes the address of an application image
