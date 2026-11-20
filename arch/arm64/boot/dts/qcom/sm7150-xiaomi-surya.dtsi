@@ -859,6 +859,10 @@
 	status = "okay";
 };
 
+&q6lsm {
+	status = "okay";
+};
+
 &q6voicedai {
 	dai@1 {
 		reg = <VOICEMMODE1>;

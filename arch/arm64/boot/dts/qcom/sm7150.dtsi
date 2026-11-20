@@ -2668,6 +2668,27 @@
 
 						status = "disabled";
 					};
+
+					/*
+					 * Listen (LSM) keyword detection, driven from
+					 * userspace through /dev/q6lsm (q6lsm driver).
+					 * lsm-mem carries the IOMMU stream the DSP reads
+					 * the sound model through, as q6asm-dais does.
+					 */
+					q6lsm: service@d {
+						compatible = "qcom,q6lsm";
+						reg = <APR_SVC_LSM>;
+
+						qcom,protection-domain = "avs/audio",
+									 "msm/adsp/audio_pd";
+
+						status = "disabled";
+
+						lsm-mem {
+							compatible = "qcom,q6lsm-mem";
+							iommus = <&apps_smmu 0x1b21 0x0>;
+						};
+					};
 				};
 
 				fastrpc {

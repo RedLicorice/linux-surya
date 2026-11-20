@@ -156,6 +156,14 @@ config SND_SOC_QDSP6
 	 audio drivers. This includes q6asm, q6adm,
 	 q6afe interfaces to DSP using apr.
 
+config SND_SOC_QDSP6_LSM
+	tristate "QDSP6 Listen (LSM) keyword detection service"
+	depends on SND_SOC_QDSP6
+	help
+	  Keyword detection on the aDSP's Listen service (SVA): one session,
+	  driven from userspace through /dev/q6lsm (open, parameters, sound
+	  model, start, detection events, stop).
+
 config SND_SOC_QDSP6_Q6VOICE_DAI
 	tristate
 
