@@ -378,13 +378,14 @@ static void apr_device_remove(struct device *dev)
 {
 	struct apr_device *adev = to_apr_device(dev);
 	struct apr_driver *adrv = to_apr_driver(dev->driver);
-	struct packet_router *apr = dev_get_drvdata(adev->dev.parent);
 
 	if (adrv->remove)
 		adrv->remove(adev);
-	spin_lock(&apr->svcs_lock);
-	idr_remove(&apr->svcs_idr, adev->svc.id);
-	spin_unlock(&apr->svcs_lock);
+	adev->svc.callback = NULL;	/* the driver's code may be unloaded next */
+	/*
+	 * The service stays in svcs_idr while the device exists (apr_remove_device takes it out): a driver bound
+	 * again (rmmod, modprobe) gets the DSP's answers; the router drops them while no driver is bound.
+	 */
 }
 
 static int apr_uevent(const struct device *dev, struct kobj_uevent_env *env)
@@ -563,13 +564,14 @@ static void of_register_apr_devices(struct device *dev, const char *svc_path)
 static int apr_remove_device(struct device *dev, void *svc_path)
 {
 	struct apr_device *adev = to_apr_device(dev);
+	struct packet_router *apr = dev_get_drvdata(adev->dev.parent);
 
-	if (svc_path && adev->service_path) {
-		if (!strcmp(adev->service_path, (char *)svc_path))
-			device_unregister(&adev->dev);
-	} else {
-		device_unregister(&adev->dev);
-	}
+	if (svc_path && adev->service_path && strcmp(adev->service_path, (char *)svc_path))
+		return 0;
+	spin_lock(&apr->svcs_lock);
+	idr_remove(&apr->svcs_idr, adev->svc.id);
+	spin_unlock(&apr->svcs_lock);
+	device_unregister(&adev->dev);
 
 	return 0;
 }
