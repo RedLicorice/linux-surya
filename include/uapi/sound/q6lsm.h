@@ -69,5 +69,7 @@ struct q6lsm_event {
 #define Q6LSM_IOC_REGISTER_MODEL	_IOW(Q6LSM_IOC_MAGIC, 0x03, struct q6lsm_model)
 #define Q6LSM_IOC_START			_IO(Q6LSM_IOC_MAGIC, 0x04)
 #define Q6LSM_IOC_STOP			_IO(Q6LSM_IOC_MAGIC, 0x05)
+/* the vendor calibration's custom topologies blob (data/size as for a model), before an open that names one */
+#define Q6LSM_IOC_ADD_TOPOLOGIES	_IOW(Q6LSM_IOC_MAGIC, 0x06, struct q6lsm_model)
 
 #endif /* _UAPI__SOUND_Q6LSM_H */

@@ -39,6 +39,7 @@
 #define LSM_SESSION_CMD_STOP				0x00012A87
 #define LSM_SESSION_CMD_CLOSE_TX			0x00012A88
 #define LSM_SESSION_CMD_OPEN_TX_V2			0x00012A8B
+#define LSM_CMD_ADD_TOPOLOGIES				0x00012A8C
 #define LSM_SESSION_CMD_SET_PARAMS_V2			0x00012A8F
 #define LSM_SESSION_CMD_OPEN_TX_V3			0x00012A95
 #define LSM_SESSION_CMD_SET_PARAMS_V3			0x00012A92
@@ -128,6 +129,14 @@ struct lsm_cmd_reg_snd_model {
 	u32 model_addr_lsw;
 	u32 model_addr_msw;
 	u32 mem_map_handle;
+} __packed;
+
+struct lsm_cmd_add_topologies {
+	struct apr_hdr hdr;
+	u32 addr_lsw;
+	u32 addr_msw;
+	u32 mem_map_handle;
+	u32 size;
 } __packed;
 
 struct avs_cmd_shared_mem_map_regions {
@@ -502,6 +511,28 @@ static int q6lsm_register_model(struct q6lsm *lsm, const struct q6lsm_model *m)
 	return q6lsm_send(lsm, &cmd.hdr);
 }
 
+/*
+ * The custom topologies of the vendor's calibration (ACDB), which the DSP needs before an OPEN_TX_V2/V3 names one of
+ * them: the blob goes as it is, the DSP parses it. Sent to the service (dest port 0), not to a session.
+ */
+static int q6lsm_add_topologies(struct q6lsm *lsm, const struct q6lsm_model *m)
+{
+	struct lsm_cmd_add_topologies cmd = {};
+	struct q6lsm_buf *buf;
+	int ret;
+
+	ret = q6lsm_map(lsm, u64_to_user_ptr(m->data), m->size, &buf);
+	if (ret)
+		return ret;
+	q6lsm_hdr(&cmd.hdr, sizeof(cmd), LSM_CMD_ADD_TOPOLOGIES);
+	cmd.hdr.dest_port = 0;
+	cmd.addr_lsw = lower_32_bits(buf->dsp_addr);
+	cmd.addr_msw = upper_32_bits(buf->dsp_addr);
+	cmd.mem_map_handle = buf->handle;
+	cmd.size = m->size;
+	return q6lsm_send(lsm, &cmd.hdr);
+}
+
 /* Back to nothing: stopped, closed, every mapping gone. Errors are logged; the DSP's state is reset anyway. */
 static void q6lsm_teardown(struct q6lsm *lsm)
 {
@@ -541,6 +572,9 @@ static long q6lsm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 	case Q6LSM_IOC_REGISTER_MODEL:
 		ret = q6lsm_register_model(lsm, &a.model);
+		break;
+	case Q6LSM_IOC_ADD_TOPOLOGIES:
+		ret = q6lsm_add_topologies(lsm, &a.model);
 		break;
 	case Q6LSM_IOC_START:
 		ret = lsm->opened ? q6lsm_simple(lsm, LSM_SESSION_CMD_START) : -ENOTCONN;
