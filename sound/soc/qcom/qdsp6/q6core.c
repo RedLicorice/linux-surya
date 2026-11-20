@@ -2,6 +2,7 @@
 // Copyright (c) 2011-2017, The Linux Foundation. All rights reserved.
 // Copyright (c) 2018, Linaro Limited
 
+#include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/wait.h>
 #include <linux/kernel.h>
@@ -22,6 +23,39 @@
 #define AVCS_GET_VERSIONS_RSP   0x00012906
 #define AVCS_CMD_GET_FWK_VERSION	0x001292c
 #define AVCS_CMDRSP_GET_FWK_VERSION	0x001292d
+#define AVCS_CMD_REGISTER_TOPOLOGIES	0x00012923
+#define AVCS_CMD_SHARED_MEM_MAP_REGIONS	0x00012924
+#define AVCS_CMDRSP_SHARED_MEM_MAP_REGIONS	0x00012925
+#define AVCS_CMD_SHARED_MEM_UNMAP_REGIONS	0x00012926
+#define AVCS_CMD_DEREGISTER_TOPOLOGIES	0x0001292a
+#define AVCS_MODE_DEREGISTER_ALL_CUSTOM_TOPOLOGIES	2
+#define AVCS_MEM_POOL_SHMEM8_4K		3
+#define AVCS_TOPOLOGIES_TIMEOUT_MS	1000
+
+/* AVCS_CMD_REGISTER_TOPOLOGIES and AVCS_CMD_DEREGISTER_TOPOLOGIES (with a mode) */
+struct avcs_cmd_topologies {
+	struct apr_hdr hdr;
+	u32 addr_lsw;
+	u32 addr_msw;
+	u32 mem_map_handle;
+	u32 size;
+	u32 mode;
+} __packed;
+
+struct avcs_cmd_shared_mem_map_regions {
+	struct apr_hdr hdr;
+	u16 mem_pool_id;
+	u16 num_regions;
+	u32 property_flag;
+	u32 shm_addr_lsw;
+	u32 shm_addr_msw;
+	u32 mem_size_bytes;
+} __packed;
+
+struct avcs_cmd_shared_mem_unmap_regions {
+	struct apr_hdr hdr;
+	u32 mem_map_handle;
+} __packed;
 
 struct avcs_svc_info {
 	uint32_t service_id;
@@ -63,6 +97,11 @@ struct q6core {
 	bool get_state_supported;
 	bool get_version_supported;
 	bool is_version_requested;
+	/* the command q6core_avcs_cmd() waits for: its opcode, then the DSP's status and a map's handle */
+	u32 cmd_opcode;
+	bool cmd_done;
+	u32 cmd_status;
+	u32 cmd_handle;
 };
 
 static struct q6core *g_core;
@@ -93,9 +132,23 @@ static int q6core_callback(struct apr_device *adev, const struct apr_resp_pkt *d
 				core->get_state_supported = false;
 			core->resp_received = true;
 			break;
+		default:
+			if (result->opcode == core->cmd_opcode) {
+				core->cmd_status = result->status;
+				core->cmd_done = true;
+				wake_up(&core->wait);
+			}
 		}
 		break;
 	}
+	case AVCS_CMDRSP_SHARED_MEM_MAP_REGIONS:
+		if (core->cmd_opcode == AVCS_CMD_SHARED_MEM_MAP_REGIONS) {
+			core->cmd_handle = *(const u32 *)data->payload;
+			core->cmd_status = 0;
+			core->cmd_done = true;
+			wake_up(&core->wait);
+		}
+		break;
 	case AVCS_CMDRSP_GET_FWK_VERSION: {
 		struct avcs_cmdrsp_get_fwk_version *fwk;
 
@@ -147,6 +200,85 @@ static int q6core_callback(struct apr_device *adev, const struct apr_resp_pkt *d
 
 	return 0;
 }
+
+/* Send one AVCS command and wait for its answer: 0, -EIO (the DSP's status logged) or -ETIMEDOUT. core->lock held. */
+static int q6core_avcs_cmd(struct q6core *core, struct apr_hdr *hdr)
+{
+	int rc;
+
+	hdr->hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, APR_HDR_LEN(APR_HDR_SIZE), APR_PKT_VER);
+	core->cmd_opcode = hdr->opcode;
+	core->cmd_done = false;
+	core->cmd_status = 0;
+	rc = apr_send_pkt(core->adev, (struct apr_pkt *)hdr);
+	if (rc < 0)
+		return rc;
+	if (!wait_event_timeout(core->wait, core->cmd_done, msecs_to_jiffies(AVCS_TOPOLOGIES_TIMEOUT_MS)))
+		return -ETIMEDOUT;
+	if (core->cmd_status) {
+		dev_err(&core->adev->dev, "DSP refused 0x%x: status 0x%x\n", hdr->opcode, core->cmd_status);
+		return -EIO;
+	}
+	return 0;
+}
+
+/**
+ * q6core_register_topologies() - give the DSP custom topologies (the vendor calibration's), for every service
+ * @dsp_addr: the blob in memory the DSP reads (as the caller maps it for its own service: IOMMU stream in the upper bits)
+ * @size: bytes of the blob
+ *
+ * Earlier custom topologies are dropped first (AVCS_CMD_DEREGISTER_TOPOLOGIES, all), as downstream does. The memory is
+ * mapped to the core service for the command only; the caller frees it after.
+ *
+ * Return: 0, or a negative errno.
+ */
+int q6core_register_topologies(u64 dsp_addr, u32 size)
+{
+	struct avcs_cmd_shared_mem_map_regions map = {};
+	struct avcs_cmd_shared_mem_unmap_regions unmap = {};
+	struct avcs_cmd_topologies cmd = {};
+	struct q6core *core = g_core;
+	int rc, rc2;
+
+	if (!core || !size)
+		return -ENODEV;
+	mutex_lock(&core->lock);
+	cmd.hdr.pkt_size = sizeof(cmd);
+	cmd.hdr.opcode = AVCS_CMD_DEREGISTER_TOPOLOGIES;
+	cmd.mode = AVCS_MODE_DEREGISTER_ALL_CUSTOM_TOPOLOGIES;
+	q6core_avcs_cmd(core, &cmd.hdr);	/* none registered yet is not an error */
+
+	map.hdr.pkt_size = sizeof(map);
+	map.hdr.opcode = AVCS_CMD_SHARED_MEM_MAP_REGIONS;
+	map.mem_pool_id = AVCS_MEM_POOL_SHMEM8_4K;
+	map.num_regions = 1;
+	map.shm_addr_lsw = lower_32_bits(dsp_addr);
+	map.shm_addr_msw = upper_32_bits(dsp_addr);
+	map.mem_size_bytes = PAGE_ALIGN(size);
+	rc = q6core_avcs_cmd(core, &map.hdr);
+	if (rc)
+		goto out;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.hdr.pkt_size = sizeof(cmd) - sizeof(cmd.mode);
+	cmd.hdr.opcode = AVCS_CMD_REGISTER_TOPOLOGIES;
+	cmd.addr_lsw = lower_32_bits(dsp_addr);
+	cmd.addr_msw = upper_32_bits(dsp_addr);
+	cmd.mem_map_handle = core->cmd_handle;
+	cmd.size = size;
+	rc = q6core_avcs_cmd(core, &cmd.hdr);
+
+	unmap.hdr.pkt_size = sizeof(unmap);
+	unmap.hdr.opcode = AVCS_CMD_SHARED_MEM_UNMAP_REGIONS;
+	unmap.mem_map_handle = cmd.mem_map_handle;
+	rc2 = q6core_avcs_cmd(core, &unmap.hdr);
+	if (!rc)
+		rc = rc2;
+out:
+	mutex_unlock(&core->lock);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(q6core_register_topologies);
 
 static int q6core_get_fwk_versions(struct q6core *core)
 {
