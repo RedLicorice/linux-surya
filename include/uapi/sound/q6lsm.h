@@ -28,8 +28,11 @@ struct q6lsm_open {
 	__u32 kind;
 	__u32 value;
 	__u32 island;		/* Q6LSM_OPEN_STAGES only: run the stage in the low-power island */
-	__u32 reserved;
+	__u32 flags;		/* Q6LSM_OPEN_LOAD_MODULES */
 };
+
+/* topology opens: the core service loads the topology's modules first (AVCS_CMD_LOAD_TOPO_MODULES) */
+#define Q6LSM_OPEN_LOAD_MODULES	(1 << 0)
 
 /* q6lsm_param.flags */
 #define Q6LSM_PARAM_V3		(1 << 0)	/* SET_PARAMS_V3 with an instance id, else SET_PARAMS_V2 */

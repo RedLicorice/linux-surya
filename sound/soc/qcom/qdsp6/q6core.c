@@ -29,6 +29,8 @@
 #define AVCS_CMD_SHARED_MEM_UNMAP_REGIONS	0x00012926
 #define AVCS_CMD_DEREGISTER_TOPOLOGIES	0x0001292a
 #define AVCS_MODE_DEREGISTER_ALL_CUSTOM_TOPOLOGIES	2
+#define AVCS_CMD_LOAD_TOPO_MODULES	0x0001296C
+#define AVCS_CMD_UNLOAD_TOPO_MODULES	0x0001296D
 #define AVCS_MEM_POOL_SHMEM8_4K		3
 #define AVCS_TOPOLOGIES_TIMEOUT_MS	1000
 
@@ -279,6 +281,34 @@ out:
 	return rc;
 }
 EXPORT_SYMBOL_GPL(q6core_register_topologies);
+
+/**
+ * q6core_load_topology() - have the DSP load (or unload) the modules of one topology before a service opens it
+ * @topology_id: the topology
+ * @load: true to load, false to unload
+ *
+ * Return: 0, or a negative errno (-EIO with the DSP's status logged).
+ */
+int q6core_load_topology(u32 topology_id, bool load)
+{
+	struct {
+		struct apr_hdr hdr;
+		u32 topology_id;
+	} __packed cmd = {};
+	struct q6core *core = g_core;
+	int rc;
+
+	if (!core)
+		return -ENODEV;
+	mutex_lock(&core->lock);
+	cmd.hdr.pkt_size = sizeof(cmd);
+	cmd.hdr.opcode = load ? AVCS_CMD_LOAD_TOPO_MODULES : AVCS_CMD_UNLOAD_TOPO_MODULES;
+	cmd.topology_id = topology_id;
+	rc = q6core_avcs_cmd(core, &cmd.hdr);
+	mutex_unlock(&core->lock);
+	return rc;
+}
+EXPORT_SYMBOL_GPL(q6core_load_topology);
 
 static int q6core_get_fwk_versions(struct q6core *core)
 {

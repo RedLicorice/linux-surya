@@ -367,6 +367,11 @@ static int q6lsm_open_session(struct q6lsm *lsm, const struct q6lsm_open *o)
 
 	if (lsm->opened)
 		return -EBUSY;
+	if ((o->flags & Q6LSM_OPEN_LOAD_MODULES) && o->kind != Q6LSM_OPEN_APP_ID) {
+		ret = q6core_load_topology(o->value, true);
+		if (ret)
+			return ret;
+	}
 	switch (o->kind) {
 	case Q6LSM_OPEN_APP_ID:
 		q6lsm_hdr(&cmd.v1.hdr, sizeof(cmd.v1), LSM_SESSION_CMD_OPEN_TX);
