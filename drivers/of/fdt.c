@@ -1278,6 +1278,25 @@ static void *__init copy_device_tree(void *fdt)
  * pointers of the nodes so the normal device-tree walking functions
  * can be used.
  */
+/*
+ * A bootloader overlay may rewrite the root compatible. The DTB the kernel
+ * was built with can name the real one in "linux,compatible-override".
+ */
+static void __init of_root_compatible_override(void)
+{
+	struct property *src, *dst;
+
+	if (!of_root)
+		return;
+	src = of_find_property(of_root, "linux,compatible-override", NULL);
+	dst = of_find_property(of_root, "compatible", NULL);
+	if (!src || !dst || !src->length)
+		return;
+	pr_info("OF: root compatible overridden by linux,compatible-override\n");
+	dst->value = src->value;
+	dst->length = src->length;
+}
+
 void __init unflatten_device_tree(void)
 {
 	void *fdt = initial_boot_params;
@@ -1300,6 +1319,8 @@ void __init unflatten_device_tree(void)
 
 	__unflatten_device_tree(fdt, NULL, &of_root,
 				early_init_dt_alloc_memory_arch, false);
+
+	of_root_compatible_override();
 
 	/* Get pointer to "/chosen" and "/aliases" nodes for use everywhere */
 	of_alias_scan(early_init_dt_alloc_memory_arch);
