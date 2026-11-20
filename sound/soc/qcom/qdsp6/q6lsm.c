@@ -40,6 +40,7 @@
 #define LSM_SESSION_CMD_STOP				0x00012A87
 #define LSM_SESSION_CMD_CLOSE_TX			0x00012A88
 #define LSM_SESSION_CMD_OPEN_TX_V2			0x00012A8B
+#define LSM_CMD_ADD_TOPOLOGIES				0x00012A8C
 #define LSM_SESSION_CMD_SET_PARAMS_V2			0x00012A8F
 #define LSM_SESSION_CMD_OPEN_TX_V3			0x00012A95
 #define LSM_SESSION_CMD_SET_PARAMS_V3			0x00012A92
@@ -129,6 +130,14 @@ struct lsm_cmd_reg_snd_model {
 	u32 model_addr_lsw;
 	u32 model_addr_msw;
 	u32 mem_map_handle;
+} __packed;
+
+struct lsm_cmd_add_topologies {
+	struct apr_hdr hdr;
+	u32 addr_lsw;
+	u32 addr_msw;
+	u32 mem_map_handle;
+	u32 size;
 } __packed;
 
 struct avs_cmd_shared_mem_map_regions {
@@ -523,6 +532,21 @@ static int q6lsm_add_topologies(struct q6lsm *lsm, const struct q6lsm_model *m)
 		return -ENODEV;
 	if (!m->size || m->size > max_oob_bytes)
 		return -EINVAL;
+	if (m->reserved & Q6LSM_TOPOLOGIES_LSM) {	/* the LSM service's own table, mapped for the session */
+		struct lsm_cmd_add_topologies cmd = {};
+		struct q6lsm_buf *buf;
+
+		ret = q6lsm_map(lsm, u64_to_user_ptr(m->data), m->size, &buf);
+		if (ret)
+			return ret;
+		q6lsm_hdr(&cmd.hdr, sizeof(cmd), LSM_CMD_ADD_TOPOLOGIES);
+		cmd.hdr.dest_port = 0;
+		cmd.addr_lsw = lower_32_bits(buf->dsp_addr);
+		cmd.addr_msw = upper_32_bits(buf->dsp_addr);
+		cmd.mem_map_handle = buf->handle;
+		cmd.size = m->size;
+		return q6lsm_send(lsm, &cmd.hdr);
+	}
 	size = PAGE_ALIGN(m->size);
 	cpu = dma_alloc_coherent(lsm->mem_dev, size, &dma, GFP_KERNEL);
 	if (!cpu)
