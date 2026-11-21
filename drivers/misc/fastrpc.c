@@ -202,6 +202,8 @@ struct fastrpc_buf {
 	/* mmap support */
 	struct list_head node; /* list of user requested mmaps */
 	uintptr_t raddr;
+	/* VMIDs (bitmask) that own the memory through the hypervisor; 0 = HLOS alone */
+	u64 hyp_owners;
 };
 
 struct fastrpc_dma_buf_attachment {
@@ -280,6 +282,13 @@ struct fastrpc_channel_ctx {
 	struct fastrpc_device *secure_fdevice;
 	struct fastrpc_device *fdevice;
 	struct fastrpc_buf *remote_heap;
+	/* SDSP's reserved region, assigned to the DSP VMIDs at probe and given back at remove */
+	phys_addr_t sdsp_mem_start;
+	u64 sdsp_mem_size;
+	u64 sdsp_mem_owners;
+	/* Counted for the log: static PD creations and remote heap maps in this channel's lifetime */
+	unsigned int static_creates;
+	unsigned int heap_maps;
 	struct list_head invoke_interrupted_mmaps;
 	bool secure;
 	bool unsigned_support;
@@ -420,11 +429,49 @@ static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 	return ret;
 }
 
-static void fastrpc_buf_free(struct fastrpc_buf *buf)
+static void __fastrpc_buf_free(struct fastrpc_channel_ctx *cctx, struct fastrpc_buf *buf)
 {
 	dma_free_coherent(buf->dev, buf->size, buf->virt,
-			  fastrpc_ipa_to_dma_addr(buf->fl->cctx, buf->dma_addr));
+			  fastrpc_ipa_to_dma_addr(cctx, buf->dma_addr));
 	kfree(buf);
+}
+
+static void fastrpc_buf_free(struct fastrpc_buf *buf)
+{
+	__fastrpc_buf_free(buf->fl->cctx, buf);
+}
+
+/*
+ * Give memory that was assigned to the DSP's VMIDs back to HLOS. Freeing it without this hands Linux pages the
+ * hypervisor still gives to the DSP: a later assign from HLOS fails (-EINVAL) and a CPU touching them faults.
+ */
+static int fastrpc_mem_reclaim(struct device *dev, phys_addr_t addr, u64 size, u64 *owners)
+{
+	struct qcom_scm_vmperm perm = { .vmid = QCOM_SCM_VMID_HLOS, .perm = QCOM_SCM_PERM_RWX };
+	int err;
+
+	if (!*owners)
+		return 0;
+	err = qcom_scm_assign_mem(addr, size, owners, &perm, 1);
+	if (err) {
+		dev_err(dev, "Failed to give memory %pa size 0x%llx back to HLOS err %d\n", &addr, size, err);
+		return err;
+	}
+	*owners = 0;
+	return 0;
+}
+
+/*
+ * Free a buffer the DSP's VMIDs may own: back to HLOS first. If that fails the memory is leaked on purpose, never
+ * freed while the DSP may still own it. The channel is passed in: a remote heap outlives the user that made it.
+ */
+static void fastrpc_heap_buf_free(struct fastrpc_channel_ctx *cctx, struct fastrpc_buf *buf)
+{
+	if (fastrpc_mem_reclaim(buf->dev, buf->dma_addr, buf->size, &buf->hyp_owners)) {
+		dev_err(buf->dev, "leaking 0x%llx bytes the DSP still owns\n", buf->size);
+		return;
+	}
+	__fastrpc_buf_free(cctx, buf);
 }
 
 static int __fastrpc_buf_alloc(struct fastrpc_user *fl, struct device *dev,
@@ -528,7 +575,7 @@ static void fastrpc_user_free(struct kref *ref)
 
 	list_for_each_entry_safe(buf, b, &fl->mmaps, node) {
 		list_del(&buf->node);
-		fastrpc_buf_free(buf);
+		fastrpc_heap_buf_free(fl->cctx, buf);
 	}
 
 	fastrpc_channel_ctx_put(fl->cctx);
@@ -1348,7 +1395,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	struct fastrpc_phy_page pages[1];
 	char *name;
 	int err;
-	bool scm_done = false;
+	bool heap_new = false;
 	struct {
 		int client_id;
 		u32 namelen;
@@ -1383,6 +1430,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 						&fl->cctx->remote_heap);
 		if (err)
 			goto err_name;
+		heap_new = true;
 
 		/* Map if we have any heap VMIDs associated with this ADSP Static Process. */
 		if (fl->cctx->vmcount) {
@@ -1399,10 +1447,14 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 					fl->cctx->remote_heap->size, err);
 				goto err_map;
 			}
-			scm_done = true;
+			fl->cctx->remote_heap->hyp_owners = src_perms;
 			inbuf.pageslen = 1;
 		}
 	}
+	fl->cctx->static_creates++;
+	dev_info(fl->sctx->dev, "static PD '%.*s': creation %u of this DSP boot, heap 0x%llx, owners 0x%llx\n",
+		 (int)init.namelen, name, fl->cctx->static_creates, fl->cctx->remote_heap->size,
+		 fl->cctx->remote_heap->hyp_owners);
 
 	fl->pd = USER_PD;
 
@@ -1433,26 +1485,12 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 
 	return 0;
 err_invoke:
-	if (fl->cctx->vmcount && scm_done) {
-		u64 src_perms = 0;
-		struct qcom_scm_vmperm dst_perms;
-		u32 i;
-
-		for (i = 0; i < fl->cctx->vmcount; i++)
-			src_perms |= BIT(fl->cctx->vmperms[i].vmid);
-
-		dst_perms.vmid = QCOM_SCM_VMID_HLOS;
-		dst_perms.perm = QCOM_SCM_PERM_RWX;
-		err = qcom_scm_assign_mem(fl->cctx->remote_heap->dma_addr,
-						(u64)fl->cctx->remote_heap->size,
-						&src_perms, &dst_perms, 1);
-		if (err)
-			dev_err(fl->sctx->dev, "Failed to assign memory dma_addr %pad size 0x%llx err %d\n",
-				&fl->cctx->remote_heap->dma_addr, fl->cctx->remote_heap->size, err);
-	}
 err_map:
-	fastrpc_buf_free(fl->cctx->remote_heap);
-	fl->cctx->remote_heap = NULL;
+	/* only a heap this call made: one an earlier creation made stays with the DSP */
+	if (heap_new) {
+		fastrpc_heap_buf_free(fl->cctx, fl->cctx->remote_heap);
+		fl->cctx->remote_heap = NULL;
+	}
 err_name:
 	kfree(name);
 err:
@@ -1892,7 +1930,7 @@ static int fastrpc_req_munmap_impl(struct fastrpc_user *fl, struct fastrpc_buf *
 				      &args[0]);
 	if (!err) {
 		dev_dbg(dev, "unmmap\tpt 0x%09lx OK\n", buf->raddr);
-		fastrpc_buf_free(buf);
+		fastrpc_heap_buf_free(fl->cctx, buf);
 	} else {
 		dev_err(dev, "unmmap\tpt 0x%09lx ERROR\n", buf->raddr);
 	}
@@ -2016,6 +2054,12 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 				&buf->dma_addr, buf->size, err);
 			goto err_assign;
 		}
+		buf->hyp_owners = src_perms;
+	}
+	if (req.flags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
+		fl->cctx->heap_maps++;
+		dev_info(dev, "remote heap map %u of this DSP boot: 0x%llx bytes, owners 0x%llx\n",
+			 fl->cctx->heap_maps, buf->size, buf->hyp_owners);
 	}
 
 	spin_lock(&fl->lock);
@@ -2429,6 +2473,9 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 				    data->vmperms, data->vmcount);
 			if (err)
 				goto err_free_data;
+			data->sdsp_mem_start = res.start;
+			data->sdsp_mem_size = resource_size(&res);
+			data->sdsp_mem_owners = src_perms;
 		}
 
 	}
@@ -2529,7 +2576,10 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 		list_del(&buf->node);
 
 	if (cctx->remote_heap)
-		fastrpc_buf_free(cctx->remote_heap);
+		fastrpc_heap_buf_free(cctx, cctx->remote_heap);
+
+	/* the SDSP region is assigned again at the next probe, from HLOS */
+	fastrpc_mem_reclaim(&rpdev->dev, cctx->sdsp_mem_start, cctx->sdsp_mem_size, &cctx->sdsp_mem_owners);
 
 	of_platform_depopulate(&rpdev->dev);
 
