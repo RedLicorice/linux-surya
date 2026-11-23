@@ -282,6 +282,13 @@ struct fastrpc_channel_ctx {
 	struct fastrpc_device *secure_fdevice;
 	struct fastrpc_device *fdevice;
 	struct fastrpc_buf *remote_heap;
+	/* Serializes creating (and freeing) the static PD's remote heap */
+	struct mutex remote_heap_lock;
+	/*
+	 * ADSP_MMAP_REMOTE_HEAP_ADDR maps: they grow the static PD's heap, which outlives the process that asked
+	 * for them, so they belong to the channel (under @lock) and are only given back when the DSP is gone.
+	 */
+	struct list_head remote_heap_maps;
 	/* SDSP's reserved region, assigned to the DSP VMIDs at probe and given back at remove */
 	phys_addr_t sdsp_mem_start;
 	u64 sdsp_mem_size;
@@ -1425,6 +1432,8 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	inbuf.client_id = fl->client_id;
 	inbuf.namelen = init.namelen;
 	inbuf.pageslen = 0;
+	/* two creations at once must not both see no heap and both make one */
+	mutex_lock(&fl->cctx->remote_heap_lock);
 	if (!fl->cctx->remote_heap) {
 		err = fastrpc_remote_heap_alloc(fl, fl->sctx->dev, init.memlen,
 						&fl->cctx->remote_heap);
@@ -1480,6 +1489,7 @@ static int fastrpc_init_create_static_process(struct fastrpc_user *fl,
 	if (err)
 		goto err_invoke;
 
+	mutex_unlock(&fl->cctx->remote_heap_lock);
 	kfree(args);
 	kfree(name);
 
@@ -1491,6 +1501,7 @@ err_map:
 		fastrpc_heap_buf_free(fl->cctx, fl->cctx->remote_heap);
 		fl->cctx->remote_heap = NULL;
 	}
+	mutex_unlock(&fl->cctx->remote_heap_lock);
 err_name:
 	kfree(name);
 err:
@@ -1948,6 +1959,10 @@ static int fastrpc_req_munmap(struct fastrpc_user *fl, char __user *argp)
 	if (copy_from_user(&req, argp, sizeof(req)))
 		return -EFAULT;
 
+	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	unsigned long flags;
+	bool heap_map = false;
+
 	spin_lock(&fl->lock);
 	list_for_each_entry_safe(iter, b, &fl->mmaps, node) {
 		if ((iter->raddr == req.vaddrout) && (iter->size == req.size)) {
@@ -1959,13 +1974,30 @@ static int fastrpc_req_munmap(struct fastrpc_user *fl, char __user *argp)
 	spin_unlock(&fl->lock);
 
 	if (!buf) {
+		spin_lock_irqsave(&cctx->lock, flags);
+		list_for_each_entry_safe(iter, b, &cctx->remote_heap_maps, node) {
+			if ((iter->raddr == req.vaddrout) && (iter->size == req.size)) {
+				list_del(&iter->node);
+				buf = iter;
+				heap_map = true;
+				break;
+			}
+		}
+		spin_unlock_irqrestore(&cctx->lock, flags);
+	}
+
+	if (!buf) {
 		dev_err(dev, "mmap\t\tpt 0x%09llx [len 0x%08llx] not in list\n",
 			req.vaddrout, req.size);
 		return -EINVAL;
 	}
 
 	err = fastrpc_req_munmap_impl(fl, buf);
-	if (err) {
+	if (err && heap_map) {
+		spin_lock_irqsave(&cctx->lock, flags);
+		list_add_tail(&buf->node, &cctx->remote_heap_maps);
+		spin_unlock_irqrestore(&cctx->lock, flags);
+	} else if (err) {
 		spin_lock(&fl->lock);
 		list_add_tail(&buf->node, &fl->mmaps);
 		spin_unlock(&fl->lock);
@@ -1983,6 +2015,7 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_phy_page pages;
 	struct fastrpc_req_mmap req;
 	struct device *dev = fl->sctx->dev;
+	unsigned long flags;
 	int err;
 	u32 sc;
 
@@ -2062,13 +2095,21 @@ static int fastrpc_req_mmap(struct fastrpc_user *fl, char __user *argp)
 			 fl->cctx->heap_maps, buf->size, buf->hyp_owners);
 	}
 
-	spin_lock(&fl->lock);
-	list_add_tail(&buf->node, &fl->mmaps);
-	spin_unlock(&fl->lock);
-
+	/* before it is on a list: failing here unmaps and frees it */
 	if (copy_to_user((void __user *)argp, &req, sizeof(req))) {
 		err = -EFAULT;
 		goto err_assign;
+	}
+
+	if (req.flags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
+		/* the static PD keeps using it after this process is gone */
+		spin_lock_irqsave(&fl->cctx->lock, flags);
+		list_add_tail(&buf->node, &fl->cctx->remote_heap_maps);
+		spin_unlock_irqrestore(&fl->cctx->lock, flags);
+	} else {
+		spin_lock(&fl->lock);
+		list_add_tail(&buf->node, &fl->mmaps);
+		spin_unlock(&fl->lock);
 	}
 
 	dev_dbg(dev, "mmap\t\tpt 0x%09lx OK [len 0x%08llx]\n",
@@ -2517,6 +2558,8 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	dma_set_mask_and_coherent(rdev, DMA_BIT_MASK(32));
 	INIT_LIST_HEAD(&data->users);
 	INIT_LIST_HEAD(&data->invoke_interrupted_mmaps);
+	INIT_LIST_HEAD(&data->remote_heap_maps);
+	mutex_init(&data->remote_heap_lock);
 	spin_lock_init(&data->lock);
 	idr_init(&data->ctx_idr);
 	data->domain_id = domain_id;
@@ -2575,8 +2618,17 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 	list_for_each_entry_safe(buf, b, &cctx->invoke_interrupted_mmaps, node)
 		list_del(&buf->node);
 
+	/* the DSP is gone: the static PD's heap and what was added to it can go back to HLOS */
+	list_for_each_entry_safe(buf, b, &cctx->remote_heap_maps, node) {
+		list_del(&buf->node);
+		fastrpc_heap_buf_free(cctx, buf);
+	}
+
+	mutex_lock(&cctx->remote_heap_lock);
 	if (cctx->remote_heap)
 		fastrpc_heap_buf_free(cctx, cctx->remote_heap);
+	cctx->remote_heap = NULL;
+	mutex_unlock(&cctx->remote_heap_lock);
 
 	/* the SDSP region is assigned again at the next probe, from HLOS */
 	fastrpc_mem_reclaim(&rpdev->dev, cctx->sdsp_mem_start, cctx->sdsp_mem_size, &cctx->sdsp_mem_owners);
