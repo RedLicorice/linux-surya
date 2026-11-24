@@ -3,7 +3,9 @@
 
 #include <dt-bindings/sound/qcom,q6afe.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/remoteproc/qcom_rproc.h>
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
 #include <sound/pcm.h>
@@ -159,6 +161,66 @@ static void sm8250_add_be_ops(struct snd_soc_card *card)
 	}
 }
 
+/*
+ * Audio DSP restart.
+ *
+ * Every front end and back end of these cards lives in the audio DSP (the
+ * "lpass" remoteproc), and with the LPASS codecs (lpass-lpi) the codec side
+ * goes away and comes back with it as well. A card that is only unbound and
+ * bound again by the ASoC core when its components come back does not bind:
+ * the DAI links it parsed at probe no longer resolve ("CODEC DAI ... not
+ * registered"), and the card stays away until a reboot. A card probed again
+ * parses them afresh and binds, as at boot.
+ *
+ * So release the card before the DSP shuts down, and probe it again once the
+ * DSP is down: that defers until the DSP's components are back.
+ */
+static struct device *sm8250_ssr_dev;
+static bool sm8250_ssr_reprobe;
+static DEFINE_MUTEX(sm8250_ssr_lock);
+
+static void sm8250_ssr_track(struct device *dev)
+{
+	guard(mutex)(&sm8250_ssr_lock);
+	if (!sm8250_ssr_dev)
+		sm8250_ssr_dev = get_device(dev);
+}
+
+static int sm8250_ssr_notify(struct notifier_block *nb, unsigned long event, void *data)
+{
+	struct device *dev = NULL;
+
+	scoped_guard(mutex, &sm8250_ssr_lock) {
+		if (!sm8250_ssr_dev)
+			return NOTIFY_DONE;
+		if (event == QCOM_SSR_BEFORE_SHUTDOWN && READ_ONCE(sm8250_ssr_dev->driver)) {
+			sm8250_ssr_reprobe = true;
+			dev = get_device(sm8250_ssr_dev);
+		} else if (event == QCOM_SSR_AFTER_SHUTDOWN && sm8250_ssr_reprobe) {
+			sm8250_ssr_reprobe = false;
+			dev = get_device(sm8250_ssr_dev);
+		}
+	}
+	if (!dev)
+		return NOTIFY_DONE;
+
+	if (event == QCOM_SSR_BEFORE_SHUTDOWN) {
+		dev_info(dev, "audio DSP going down: releasing the sound card\n");
+		device_release_driver(dev);
+	} else if (device_attach(dev) < 0) {
+		dev_warn(dev, "cannot be probed again after the DSP restart\n");
+	}
+	put_device(dev);
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block sm8250_ssr_nb = {
+	.notifier_call = sm8250_ssr_notify,
+};
+
+static void *sm8250_ssr_handle;
+
 static int sm8250_platform_probe(struct platform_device *pdev)
 {
 	struct snd_soc_card *card;
@@ -185,7 +247,11 @@ static int sm8250_platform_probe(struct platform_device *pdev)
 
 	card->driver_name = of_device_get_match_data(dev);
 	sm8250_add_be_ops(card);
-	return devm_snd_soc_register_card(dev, card);
+	ret = devm_snd_soc_register_card(dev, card);
+	if (!ret)
+		sm8250_ssr_track(dev);
+
+	return ret;
 }
 
 static const struct of_device_id snd_sm8250_dt_match[] = {
@@ -207,7 +273,27 @@ static struct platform_driver snd_sm8250_driver = {
 		.of_match_table = snd_sm8250_dt_match,
 	},
 };
-module_platform_driver(snd_sm8250_driver);
+static int __init snd_sm8250_init(void)
+{
+	sm8250_ssr_handle = qcom_register_ssr_notifier("lpass", &sm8250_ssr_nb);
+	if (IS_ERR(sm8250_ssr_handle)) {
+		pr_warn("snd-sm8250: no audio DSP restart notifier: %ld\n", PTR_ERR(sm8250_ssr_handle));
+		sm8250_ssr_handle = NULL;
+	}
+
+	return platform_driver_register(&snd_sm8250_driver);
+}
+module_init(snd_sm8250_init);
+
+static void __exit snd_sm8250_exit(void)
+{
+	platform_driver_unregister(&snd_sm8250_driver);
+	if (sm8250_ssr_handle)
+		qcom_unregister_ssr_notifier(sm8250_ssr_handle, &sm8250_ssr_nb);
+	if (sm8250_ssr_dev)
+		put_device(sm8250_ssr_dev);
+}
+module_exit(snd_sm8250_exit);
 MODULE_AUTHOR("Srinivas Kandagatla <srinivas.kandagatla@linaro.org");
 MODULE_DESCRIPTION("SM8250 ASoC Machine Driver");
 MODULE_LICENSE("GPL");
