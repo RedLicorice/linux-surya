@@ -4,6 +4,7 @@
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/interrupt.h>
+#include <linux/irqdomain.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -1698,8 +1699,34 @@ static void qcom_swrm_remove(struct platform_device *pdev)
 {
 	struct qcom_swrm_ctrl *ctrl = dev_get_drvdata(&pdev->dev);
 
+	/*
+	 * Runtime PM back to where probe found it: resumed (hclk on, as probe
+	 * left it), then disabled and suspended. Left enabled, the next probe
+	 * of the same device resumes the controller as soon as the bus master
+	 * device is added, before the bus is set up (NULL dereference in
+	 * sdw_bus_exit_clk_stop()), and hclk would be disabled twice here.
+	 */
+	pm_runtime_get_sync(&pdev->dev);
+	pm_runtime_disable(&pdev->dev);
+	pm_runtime_put_noidle(&pdev->dev);
+	pm_runtime_set_suspended(&pdev->dev);
+
 	sdw_bus_master_delete(&ctrl->bus);
 	clk_disable_unprepare(ctrl->hclk);
+
+	/*
+	 * The interrupts are requested rising-edge while the DT describes them
+	 * level-high, which changes the mapping's trigger type. Left as it is,
+	 * the next probe (the driver bound again, e.g. after an audio DSP
+	 * restart) cannot map the interrupt ("type mismatch") and fails. Free
+	 * them and drop the mappings, so that probe maps them afresh.
+	 */
+	if (ctrl->wake_irq > 0) {
+		devm_free_irq(&pdev->dev, ctrl->wake_irq, ctrl);
+		irq_dispose_mapping(ctrl->wake_irq);
+	}
+	devm_free_irq(&pdev->dev, ctrl->irq, ctrl);
+	irq_dispose_mapping(ctrl->irq);
 }
 
 static int __maybe_unused swrm_runtime_resume(struct device *dev)
