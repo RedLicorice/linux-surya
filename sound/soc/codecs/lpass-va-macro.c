@@ -1703,6 +1703,16 @@ static void va_macro_remove(struct platform_device *pdev)
 {
 	struct va_macro *va = dev_get_drvdata(&pdev->dev);
 
+	/*
+	 * Clocks and runtime PM back in the state probe left them in, so the
+	 * clocks below are disabled once and the next probe (the driver bound
+	 * again, e.g. after an audio DSP restart) enables runtime PM cleanly.
+	 */
+	pm_runtime_get_sync(&pdev->dev);
+	pm_runtime_disable(&pdev->dev);
+	pm_runtime_put_noidle(&pdev->dev);
+	pm_runtime_set_suspended(&pdev->dev);
+
 	if (va->has_npl_clk)
 		clk_disable_unprepare(va->npl);
 
