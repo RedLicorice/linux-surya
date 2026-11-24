@@ -18,6 +18,7 @@
 #include <linux/pinctrl/pinmux.h>
 #include <linux/pm_clock.h>
 #include <linux/pm_runtime.h>
+#include <linux/remoteproc/qcom_rproc.h>
 
 #include "../pinctrl-utils.h"
 
@@ -496,6 +497,163 @@ err_pinctrl:
 	return ret;
 }
 
+/*
+ * Audio DSP restart.
+ *
+ * On SoCs where the audio DSP (the "lpass" remoteproc) provides the LPASS core
+ * clocks and votes (q6afe / q6prm clock controllers), everything in the LPASS
+ * audio island depends on that DSP: this pin controller, the rx/tx/va/wsa
+ * macros clocked by it, the SoundWire masters clocked by the macros and the
+ * codecs on those buses. When the DSP stops, its clock controller is removed
+ * with its services, but none of these devices is unbound: firmware device
+ * links point them at the remoteproc, which stays bound. They keep handles to
+ * clocks that no longer exist, the macros' register caches no longer match
+ * the hardware, and the SoundWire buses lose their slaves; nothing recovers
+ * until a reboot.
+ *
+ * So take the island down while the DSP is still running, and let it come
+ * back as it does at boot. Before the DSP shuts down, the driver is released
+ * from this device; the device links release its consumers (the macros) first,
+ * and theirs (the SoundWire masters, the codecs, the sound card) before them.
+ * Once the DSP is down, the device is probed again: that defers until the DSP
+ * is back and its clock controller registered, and the consumers follow
+ * through their links (DL_FLAG_AUTOPROBE_CONSUMER), each probed with fresh
+ * clocks and a freshly enumerated bus.
+ *
+ * Only devices clocked by a DSP clock controller take part: on SoCs where the
+ * LPASS does not depend on the DSP, a DSP restart must not touch them.
+ */
+struct lpi_ssr_dev {
+	struct list_head node;
+	struct device *dev;
+	bool reprobe;
+};
+
+static LIST_HEAD(lpi_ssr_devs);
+static DEFINE_MUTEX(lpi_ssr_lock);
+
+static bool lpi_clocked_by_dsp(struct device_node *np)
+{
+	struct of_phandle_args args;
+	bool dsp = false;
+	int i;
+
+	for (i = 0; !dsp && !of_parse_phandle_with_args(np, "clocks", "#clock-cells", i, &args); i++) {
+		dsp = of_device_is_compatible(args.np, "qcom,q6afe-clocks") ||
+		      of_device_is_compatible(args.np, "qcom,q6prm-lpass-clocks");
+		of_node_put(args.np);
+	}
+
+	return dsp;
+}
+
+static void lpi_ssr_track(struct device *dev)
+{
+	struct lpi_ssr_dev *e;
+
+	if (!lpi_clocked_by_dsp(dev->of_node))
+		return;
+
+	guard(mutex)(&lpi_ssr_lock);
+	list_for_each_entry(e, &lpi_ssr_devs, node)
+		if (e->dev == dev)
+			return;
+
+	e = kzalloc(sizeof(*e), GFP_KERNEL);
+	if (!e)
+		return;
+	e->dev = get_device(dev);
+	list_add_tail(&e->node, &lpi_ssr_devs);
+}
+
+/* The devices to act on, referenced, so the lock is not held across probe/remove */
+static int lpi_ssr_collect(struct device **devs, int max, bool down)
+{
+	struct lpi_ssr_dev *e;
+	int n = 0;
+
+	guard(mutex)(&lpi_ssr_lock);
+	list_for_each_entry(e, &lpi_ssr_devs, node) {
+		if (n == max)
+			break;
+		if (down) {
+			if (!READ_ONCE(e->dev->driver))
+				continue;
+			e->reprobe = true;
+		} else {
+			if (!e->reprobe)
+				continue;
+			e->reprobe = false;
+		}
+		devs[n++] = get_device(e->dev);
+	}
+
+	return n;
+}
+
+#define LPI_SSR_MAX_DEVS	4
+
+static int lpi_ssr_notify(struct notifier_block *nb, unsigned long event, void *data)
+{
+	struct device *devs[LPI_SSR_MAX_DEVS];
+	int i, n;
+
+	switch (event) {
+	case QCOM_SSR_BEFORE_SHUTDOWN:
+		n = lpi_ssr_collect(devs, ARRAY_SIZE(devs), true);
+		for (i = 0; i < n; i++) {
+			dev_info(devs[i], "audio DSP going down: releasing the LPASS audio devices\n");
+			device_release_driver(devs[i]);
+			put_device(devs[i]);
+		}
+		break;
+	case QCOM_SSR_AFTER_SHUTDOWN:
+		n = lpi_ssr_collect(devs, ARRAY_SIZE(devs), false);
+		for (i = 0; i < n; i++) {
+			/* defers until the DSP and its clock controller are back */
+			if (device_attach(devs[i]) < 0)
+				dev_warn(devs[i], "cannot be probed again after the DSP restart\n");
+			put_device(devs[i]);
+		}
+		break;
+	}
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block lpi_ssr_nb = {
+	.notifier_call = lpi_ssr_notify,
+};
+
+static void *lpi_ssr_handle;
+
+static int __init lpi_ssr_init(void)
+{
+	lpi_ssr_handle = qcom_register_ssr_notifier("lpass", &lpi_ssr_nb);
+	if (IS_ERR(lpi_ssr_handle)) {
+		pr_warn("lpass-lpi: no audio DSP restart notifier: %ld\n", PTR_ERR(lpi_ssr_handle));
+		lpi_ssr_handle = NULL;
+	}
+
+	return 0;
+}
+module_init(lpi_ssr_init);
+
+static void __exit lpi_ssr_exit(void)
+{
+	struct lpi_ssr_dev *e, *t;
+
+	if (lpi_ssr_handle)
+		qcom_unregister_ssr_notifier(lpi_ssr_handle, &lpi_ssr_nb);
+
+	list_for_each_entry_safe(e, t, &lpi_ssr_devs, node) {
+		list_del(&e->node);
+		put_device(e->dev);
+		kfree(e);
+	}
+}
+module_exit(lpi_ssr_exit);
+
 int lpi_pinctrl_probe(struct platform_device *pdev)
 {
 	const struct lpi_pinctrl_variant_data *data;
@@ -577,6 +735,8 @@ int lpi_pinctrl_probe(struct platform_device *pdev)
 		dev_err(pctrl->dev, "can't add gpio chip\n");
 		goto err_pinctrl;
 	}
+
+	lpi_ssr_track(dev);
 
 	return 0;
 

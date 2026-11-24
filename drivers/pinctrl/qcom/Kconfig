@@ -57,6 +57,7 @@ config PINCTRL_LPASS_LPI
 	select GENERIC_PINCTRL_GROUPS
 	depends on PM_CLK
 	depends on GPIOLIB
+	depends on QCOM_RPROC_COMMON || !QCOM_RPROC_COMMON
 	help
 	  This is the pinctrl, pinmux, pinconf and gpiolib driver for the
 	  Qualcomm Technologies Inc LPASS (Low Power Audio SubSystem) LPI
