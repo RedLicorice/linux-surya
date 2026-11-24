@@ -252,6 +252,20 @@
 				sound-dai = <&vamacro 0>;
 			};
 		};
+
+		/*
+		 * Echo-cancelled capture (PCM 8, after every other link so the
+		 * numbers above stay): Android's VoIP capture, an ADM COPP with
+		 * the ACDB's topology and the speaker port as echo reference,
+		 * set by the "MultiMedia4 ADM Topology" / "EC Reference"
+		 * controls (q6routing).
+		 */
+		mm4-dai-link {
+			link-name = "MultiMedia4";
+			cpu {
+				sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA4>;
+			};
+		};
 	};
 
 	/*
@@ -845,6 +859,15 @@
 	dai@2 {
 		reg = <MSM_FRONTEND_DAI_MULTIMEDIA3>;
 	};
+
+	dai@3 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA4>;
+	};
+};
+
+/* the ADM COPP calibration files (adm-<topology>-<rate>-<channels>.bin, from the ACDB) */
+&q6adm {
+	firmware-name = "qcom/sm7150/surya/adm";
 };
 
 &q6cvp {
