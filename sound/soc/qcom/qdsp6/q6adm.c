@@ -3,6 +3,7 @@
 // Copyright (c) 2018, Linaro Limited
 
 #include <linux/device.h>
+#include <linux/firmware.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/kref.h>
@@ -25,6 +26,12 @@
 #define ADM_CMDRSP_DEVICE_OPEN_V5	0x00010329
 #define ADM_CMD_DEVICE_CLOSE_V5		0x00010327
 #define ADM_CMD_MATRIX_MAP_ROUTINGS_V5	0x00010325
+#define ADM_CMD_SET_PP_PARAMS_V6	0x0001035D
+#define ADM_CMD_DEVICE_OPEN_V6		0x00010356
+#define ADM_CMDRSP_DEVICE_OPEN_V6	0x00010357
+#define ADM_ENDPOINT_NONE		0xFFFF
+/* In-band SET_PP_PARAMS packets stay below what the DSP's APR transport takes in one message */
+#define ADM_PP_PARAMS_MAX_INBAND	3584
 
 #define TIMEOUT_MS 1000
 #define RESET_COPP_ID 99
@@ -45,6 +52,7 @@ struct q6copp {
 	int channels;
 	int app_type;
 	int acdb_id;
+	struct q6adm_ec_ref ec;
 
 	struct aprv2_ibasic_rsp_result_t result;
 	struct kref refcount;
@@ -63,6 +71,7 @@ struct q6adm {
 	struct aprv2_ibasic_rsp_result_t result;
 	struct mutex lock;
 	wait_queue_head_t matrix_map_wait;
+	const char *cal_dir;
 };
 
 struct q6adm_cmd_device_open_v5 {
@@ -75,6 +84,34 @@ struct q6adm_cmd_device_open_v5 {
 	u16 bit_width;
 	u32 sample_rate;
 	u8 dev_channel_mapping[8];
+} __packed;
+
+struct q6adm_cmd_device_open_v6 {
+	struct q6adm_cmd_device_open_v5 v5;
+	u16 dev_num_channel_eid2;
+	u16 bit_width_eid2;
+	u32 sample_rate_eid2;
+	u8 dev_channel_mapping_eid2[8];
+} __packed;
+
+struct q6adm_cmd_set_pp_params {
+	u32 data_payload_addr_lsw;
+	u32 data_payload_addr_msw;
+	u32 mem_map_handle;
+	u32 payload_size;
+} __packed;
+
+/*
+ * Parameter header of ADM_CMD_SET_PP_PARAMS_V6 (instance aware), which is also
+ * the layout of the calibration files: a run of these, each followed by
+ * param_size bytes of data padded to four bytes.
+ */
+struct q6adm_param_hdr_v3 {
+	__le32 module_id;
+	__le16 instance_id;
+	__le16 reserved;
+	__le32 param_id;
+	__le32 param_size;
 } __packed;
 
 struct q6adm_cmd_matrix_map_routings_v5 {
@@ -218,7 +255,9 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 		}
 		switch (result->opcode) {
 		case ADM_CMD_DEVICE_OPEN_V5:
+		case ADM_CMD_DEVICE_OPEN_V6:
 		case ADM_CMD_DEVICE_CLOSE_V5:
+		case ADM_CMD_SET_PP_PARAMS_V6:
 			list_for_each_entry(copp, &adm->copps_list, node) {
 				if ((port_idx == copp->afe_port) && (copp_idx == copp->copp_idx)) {
 					copp->result = *result;
@@ -239,7 +278,8 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 		}
 		return 0;
 	}
-	case ADM_CMDRSP_DEVICE_OPEN_V5: {
+	case ADM_CMDRSP_DEVICE_OPEN_V5:
+	case ADM_CMDRSP_DEVICE_OPEN_V6: {
 		struct adm_cmd_rsp_device_open_v5 {
 			u32 status;
 			u16 copp_id;
@@ -302,7 +342,7 @@ static struct q6copp *q6adm_find_matching_copp(struct q6adm *adm,
 					       int port_id, int topology,
 					       int mode, int rate,
 					       int channel_mode, int bit_width,
-					       int app_type)
+					       int app_type, int ec_port)
 {
 	struct q6copp *c;
 	struct q6copp *ret = NULL;
@@ -313,7 +353,8 @@ static struct q6copp *q6adm_find_matching_copp(struct q6adm *adm,
 	list_for_each_entry(c, &adm->copps_list, node) {
 		if ((port_id == c->afe_port) && (topology == c->topology) &&
 		    (mode == c->mode) && (rate == c->rate) &&
-		    (bit_width == c->bit_width) && (app_type == c->app_type)) {
+		    (bit_width == c->bit_width) && (app_type == c->app_type) &&
+		    (ec_port == c->ec.port_id)) {
 			ret = c;
 			kref_get(&c->refcount);
 		}
@@ -327,17 +368,20 @@ static int q6adm_device_open(struct q6adm *adm, struct q6copp *copp,
 			     int port_id, int path, int topology,
 			     int channel_mode, int bit_width, int rate)
 {
+	struct q6adm_cmd_device_open_v6 *open6;
 	struct q6adm_cmd_device_open_v5 *open;
 	int afe_port = q6afe_get_port_id(port_id);
+	bool ec = copp->ec.port_id >= 0;
 	struct apr_pkt *pkt;
-	int ret, pkt_size = APR_HDR_SIZE + sizeof(*open);
+	int ret, pkt_size = APR_HDR_SIZE + (ec ? sizeof(*open6) : sizeof(*open));
 
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
 
 	pkt = p;
-	open = p + APR_HDR_SIZE;
+	open6 = p + APR_HDR_SIZE;
+	open = &open6->v5;
 	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
 					   APR_HDR_LEN(APR_HDR_SIZE),
 					   APR_PKT_VER);
@@ -345,10 +389,11 @@ static int q6adm_device_open(struct q6adm *adm, struct q6copp *copp,
 	pkt->hdr.src_port = afe_port;
 	pkt->hdr.dest_port = afe_port;
 	pkt->hdr.token = port_id << 16 | copp->copp_idx;
-	pkt->hdr.opcode = ADM_CMD_DEVICE_OPEN_V5;
+	pkt->hdr.opcode = ec ? ADM_CMD_DEVICE_OPEN_V6 : ADM_CMD_DEVICE_OPEN_V5;
 	open->flags = ADM_LEGACY_DEVICE_SESSION;
 	open->mode_of_operation = path;
 	open->endpoint_id_1 = afe_port;
+	open->endpoint_id_2 = ADM_ENDPOINT_NONE;
 	open->topology_id = topology;
 	open->dev_num_channel = channel_mode & 0x00FF;
 	open->bit_width = bit_width;
@@ -359,7 +404,113 @@ static int q6adm_device_open(struct q6adm *adm, struct q6copp *copp,
 	if (ret)
 		return ret;
 
-	return q6adm_apr_send_copp_pkt(adm, copp, pkt, ADM_CMDRSP_DEVICE_OPEN_V5);
+	if (ec) {
+		open->endpoint_id_2 = q6afe_get_port_id(copp->ec.port_id);
+		open6->dev_num_channel_eid2 = copp->ec.channels;
+		open6->bit_width_eid2 = copp->ec.bit_width;
+		open6->sample_rate_eid2 = copp->ec.rate;
+		ret = q6dsp_map_channels(&open6->dev_channel_mapping_eid2[0],
+					 copp->ec.channels);
+		if (ret)
+			return ret;
+	}
+
+	return q6adm_apr_send_copp_pkt(adm, copp, pkt, ec ? ADM_CMDRSP_DEVICE_OPEN_V6 :
+				       ADM_CMDRSP_DEVICE_OPEN_V5);
+}
+
+static int q6adm_send_pp_params(struct q6adm *adm, struct q6copp *copp,
+				const void *params, size_t size)
+{
+	struct q6adm_cmd_set_pp_params *cmd;
+	int afe_port = q6afe_get_port_id(copp->afe_port);
+	int pkt_size = APR_HDR_SIZE + sizeof(*cmd) + size;
+	struct apr_pkt *pkt;
+
+	void *p __free(kfree) = kzalloc(pkt_size, GFP_KERNEL);
+	if (!p)
+		return -ENOMEM;
+
+	pkt = p;
+	cmd = p + APR_HDR_SIZE;
+	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
+					   APR_HDR_LEN(APR_HDR_SIZE),
+					   APR_PKT_VER);
+	pkt->hdr.pkt_size = pkt_size;
+	pkt->hdr.src_port = afe_port;
+	pkt->hdr.dest_port = copp->id;
+	pkt->hdr.token = copp->afe_port << 16 | copp->copp_idx;
+	pkt->hdr.opcode = ADM_CMD_SET_PP_PARAMS_V6;
+	cmd->payload_size = size;
+	memcpy(cmd + 1, params, size);
+
+	return q6adm_apr_send_copp_pkt(adm, copp, pkt, 0);
+}
+
+/*
+ * The COPP's calibration, if the board ships one for this topology, rate and
+ * channel count: <firmware-name>/adm-<topology>-<rate>-<channels>.bin, sent
+ * in-band right after the open, several parameters per packet. A missing file
+ * leaves the topology on the DSP's defaults.
+ */
+static void q6adm_send_cal(struct q6adm *adm, struct q6copp *copp)
+{
+	const struct firmware *fw;
+	size_t off = 0, used = 0, sent = 0, n = 0;
+	char name[128];
+	int ret;
+
+	if (!adm->cal_dir || copp->topology == NULL_COPP_TOPOLOGY)
+		return;
+
+	snprintf(name, sizeof(name), "%s/adm-%08x-%d-%d.bin", adm->cal_dir,
+		 copp->topology, copp->rate, copp->channels);
+	if (firmware_request_nowarn(&fw, name, adm->dev))
+		return;
+
+	void *buf __free(kfree) = kzalloc(ADM_PP_PARAMS_MAX_INBAND, GFP_KERNEL);
+	if (!buf)
+		goto out;
+
+	while (off + sizeof(struct q6adm_param_hdr_v3) <= fw->size) {
+		const struct q6adm_param_hdr_v3 *in = (const void *)fw->data + off;
+		u32 size = le32_to_cpu(in->param_size);
+		size_t need = sizeof(*in) + ALIGN(size, 4);
+
+		if (size > fw->size - off - sizeof(*in)) {
+			dev_err(adm->dev, "%s: truncated at %zu\n", name, off);
+			break;
+		}
+		off += need;
+
+		if (need > ADM_PP_PARAMS_MAX_INBAND) {
+			dev_warn(adm->dev, "%s: module %#x param %#x (%u bytes) too large for in-band, skipped\n",
+				 name, le32_to_cpu(in->module_id), le32_to_cpu(in->param_id), size);
+			continue;
+		}
+		if (used + need > ADM_PP_PARAMS_MAX_INBAND) {
+			ret = q6adm_send_pp_params(adm, copp, buf, used);
+			if (ret < 0)
+				dev_warn(adm->dev, "%s: SET_PP_PARAMS failed: %d\n", name, ret);
+			sent += used;
+			used = 0;
+		}
+		/* the file is already in the DSP's layout: header, data, padding */
+		memcpy(buf + used, in, sizeof(*in) + size);
+		memset(buf + used + sizeof(*in) + size, 0, need - sizeof(*in) - size);
+		used += need;
+		n++;
+	}
+	if (used) {
+		ret = q6adm_send_pp_params(adm, copp, buf, used);
+		if (ret < 0)
+			dev_warn(adm->dev, "%s: SET_PP_PARAMS failed: %d\n", name, ret);
+		sent += used;
+	}
+	dev_info(adm->dev, "copp %#x: %zu calibration parameters (%zu bytes) from %s\n",
+		 copp->id, n, sent, name);
+out:
+	release_firmware(fw);
 }
 
 /**
@@ -378,9 +529,10 @@ static int q6adm_device_open(struct q6adm *adm, struct q6copp *copp,
  *
  * Return: Will be an negative on error or a valid copp pointer on success.
  */
-struct q6copp *q6adm_open(struct device *dev, int port_id, int path, int rate,
-	       int channel_mode, int topology, int perf_mode,
-	       uint16_t bit_width, int app_type, int acdb_id)
+struct q6copp *q6adm_open_ec(struct device *dev, int port_id, int path, int rate,
+			      int channel_mode, int topology, int perf_mode,
+			      uint16_t bit_width, int app_type, int acdb_id,
+			      const struct q6adm_ec_ref *ec)
 {
 	struct q6adm *adm = dev_get_drvdata(dev->parent);
 	struct q6copp *copp;
@@ -393,7 +545,8 @@ struct q6copp *q6adm_open(struct device *dev, int port_id, int path, int rate,
 	}
 
 	copp = q6adm_find_matching_copp(adm, port_id, topology, perf_mode,
-				      rate, channel_mode, bit_width, app_type);
+				      rate, channel_mode, bit_width, app_type,
+				      ec ? ec->port_id : -1);
 	if (copp) {
 		dev_err(dev, "Found Matching Copp 0x%x\n", copp->copp_idx);
 		return copp;
@@ -416,6 +569,10 @@ struct q6copp *q6adm_open(struct device *dev, int port_id, int path, int rate,
 	copp->channels = channel_mode;
 	copp->bit_width = bit_width;
 	copp->app_type = app_type;
+	copp->acdb_id = acdb_id;
+	copp->ec.port_id = -1;
+	if (ec && ec->port_id >= 0)
+		copp->ec = *ec;
 
 	ret = q6adm_device_open(adm, copp, port_id, path, topology,
 				channel_mode, bit_width, rate);
@@ -424,7 +581,18 @@ struct q6copp *q6adm_open(struct device *dev, int port_id, int path, int rate,
 		return ERR_PTR(ret);
 	}
 
+	q6adm_send_cal(adm, copp);
+
 	return copp;
+}
+EXPORT_SYMBOL_GPL(q6adm_open_ec);
+
+struct q6copp *q6adm_open(struct device *dev, int port_id, int path, int rate,
+	       int channel_mode, int topology, int perf_mode,
+	       uint16_t bit_width, int app_type, int acdb_id)
+{
+	return q6adm_open_ec(dev, port_id, path, rate, channel_mode, topology,
+			     perf_mode, bit_width, app_type, acdb_id, NULL);
 }
 EXPORT_SYMBOL_GPL(q6adm_open);
 
@@ -578,6 +746,8 @@ static int q6adm_probe(struct apr_device *adev)
 	dev_set_drvdata(dev, adm);
 	adm->dev = dev;
 	q6core_get_svc_api_info(adev->svc_id, &adm->ainfo);
+	/* optional: where the board's COPP calibration files live */
+	of_property_read_string(dev->of_node, "firmware-name", &adm->cal_dir);
 	mutex_init(&adm->lock);
 	init_waitqueue_head(&adm->matrix_map_wait);
 

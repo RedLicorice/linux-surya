@@ -339,8 +339,20 @@ struct session_data {
 	struct q6copp *copps[MAX_COPPS_PER_PORT];
 };
 
+/*
+ * Per front end ADM settings: a processing topology for the COPP (the board's
+ * ACDB ones, registered with the core service) and, for capture, the echo
+ * reference port its echo canceller reads. Set by mixer controls before the
+ * stream opens; NULL_COPP_TOPOLOGY and no reference by default.
+ */
+struct fe_adm_cfg {
+	u32 topology;
+	struct q6adm_ec_ref ec;
+};
+
 struct msm_routing_data {
 	struct session_data sessions[MAX_SESSIONS];
+	struct fe_adm_cfg fe_cfg[MAX_SESSIONS];
 	struct session_data port_data[AFE_MAX_PORTS];
 	struct device *dev;
 	struct mutex lock;
@@ -362,6 +374,7 @@ int q6routing_stream_open(int fedai_id, int perf_mode,
 			   int stream_id, int stream_type)
 {
 	int j, topology, num_copps = 0;
+	const struct q6adm_ec_ref *ec;
 	struct route_payload payload;
 	struct q6copp *copp;
 	int copp_idx;
@@ -391,10 +404,20 @@ int q6routing_stream_open(int fedai_id, int perf_mode,
 
 	payload.num_copps = 0; /* only RX needs to use payload */
 	topology = NULL_COPP_TOPOLOGY;
-	copp = q6adm_open(routing_data->dev, session->port_id,
+	ec = NULL;
+	if (fedai_id >= 0 && fedai_id < MAX_SESSIONS) {
+		struct fe_adm_cfg *cfg = &routing_data->fe_cfg[fedai_id];
+
+		if (cfg->topology)
+			topology = cfg->topology;
+		/* the echo reference is an input of capture COPPs only */
+		if (session->path_type == ADM_PATH_LIVE_REC && cfg->ec.port_id >= 0)
+			ec = &cfg->ec;
+	}
+	copp = q6adm_open_ec(routing_data->dev, session->port_id,
 			      session->path_type, session->sample_rate,
 			      session->channels, topology, perf_mode,
-			      session->bits_per_sample, 0, 0);
+			      session->bits_per_sample, 0, 0, ec);
 
 	if (IS_ERR_OR_NULL(copp)) {
 		mutex_unlock(&routing_data->lock);
@@ -1091,6 +1114,112 @@ static int routing_hw_params(struct snd_soc_component *component,
 	return 0;
 }
 
+/* "MultiMediaN ADM Topology": the topology id of the front end's COPP, 0 for none */
+static int q6routing_fe_topology_get(struct snd_kcontrol *kcontrol,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	int fe = kcontrol->private_value;
+
+	mutex_lock(&routing_data->lock);
+	ucontrol->value.integer.value[0] = routing_data->fe_cfg[fe].topology;
+	mutex_unlock(&routing_data->lock);
+	return 0;
+}
+
+static int q6routing_fe_topology_put(struct snd_kcontrol *kcontrol,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	int fe = kcontrol->private_value;
+	u32 v = (u32)ucontrol->value.integer.value[0];
+	int changed;
+
+	mutex_lock(&routing_data->lock);
+	changed = routing_data->fe_cfg[fe].topology != v;
+	routing_data->fe_cfg[fe].topology = v;
+	mutex_unlock(&routing_data->lock);
+	return changed;
+}
+
+static int q6routing_fe_topology_info(struct snd_kcontrol *kcontrol,
+				      struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 1;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = 0xffffffff;
+	return 0;
+}
+
+/*
+ * "MultiMediaN EC Reference": the echo reference of the capture COPP as
+ * {AFE DAI id or -1, channels, rate, bits}.
+ */
+static int q6routing_fe_ec_get(struct snd_kcontrol *kcontrol,
+			       struct snd_ctl_elem_value *ucontrol)
+{
+	struct q6adm_ec_ref *ec = &routing_data->fe_cfg[kcontrol->private_value].ec;
+
+	mutex_lock(&routing_data->lock);
+	ucontrol->value.integer.value[0] = ec->port_id;
+	ucontrol->value.integer.value[1] = ec->channels;
+	ucontrol->value.integer.value[2] = ec->rate;
+	ucontrol->value.integer.value[3] = ec->bit_width;
+	mutex_unlock(&routing_data->lock);
+	return 0;
+}
+
+static int q6routing_fe_ec_put(struct snd_kcontrol *kcontrol,
+			       struct snd_ctl_elem_value *ucontrol)
+{
+	struct q6adm_ec_ref *ec = &routing_data->fe_cfg[kcontrol->private_value].ec;
+	long *v = ucontrol->value.integer.value;
+	struct q6adm_ec_ref n = {
+		.port_id = v[0], .channels = v[1], .rate = v[2], .bit_width = v[3],
+	};
+	int changed;
+
+	if (n.port_id >= AFE_MAX_PORTS || n.channels < 1 || n.channels > 8 ||
+	    n.rate < 8000 || n.rate > 384000 ||
+	    (n.bit_width != 16 && n.bit_width != 24 && n.bit_width != 32))
+		return -EINVAL;
+	if (n.port_id < 0)
+		n.port_id = -1;
+	mutex_lock(&routing_data->lock);
+	changed = memcmp(ec, &n, sizeof(n)) != 0;
+	*ec = n;
+	mutex_unlock(&routing_data->lock);
+	return changed;
+}
+
+static int q6routing_fe_ec_info(struct snd_kcontrol *kcontrol,
+				struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 4;
+	uinfo->value.integer.min = -1;
+	uinfo->value.integer.max = 384000;
+	return 0;
+}
+
+#define Q6ROUTING_FE_ADM_CONTROLS(n) \
+	{ .iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = "MultiMedia" #n " ADM Topology", \
+	  .info = q6routing_fe_topology_info, .get = q6routing_fe_topology_get, \
+	  .put = q6routing_fe_topology_put, .private_value = (n) - 1 }, \
+	{ .iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = "MultiMedia" #n " EC Reference", \
+	  .info = q6routing_fe_ec_info, .get = q6routing_fe_ec_get, \
+	  .put = q6routing_fe_ec_put, .private_value = (n) - 1 }
+
+static const struct snd_kcontrol_new q6routing_fe_adm_controls[] = {
+	Q6ROUTING_FE_ADM_CONTROLS(1),
+	Q6ROUTING_FE_ADM_CONTROLS(2),
+	Q6ROUTING_FE_ADM_CONTROLS(3),
+	Q6ROUTING_FE_ADM_CONTROLS(4),
+	Q6ROUTING_FE_ADM_CONTROLS(5),
+	Q6ROUTING_FE_ADM_CONTROLS(6),
+	Q6ROUTING_FE_ADM_CONTROLS(7),
+	Q6ROUTING_FE_ADM_CONTROLS(8),
+};
+
 static int msm_routing_probe(struct snd_soc_component *c)
 {
 	int i;
@@ -1098,6 +1227,9 @@ static int msm_routing_probe(struct snd_soc_component *c)
 	for (i = 0; i < MAX_SESSIONS; i++) {
 		routing_data->sessions[i].port_id = -1;
 		routing_data->sessions[i].fedai_id = -1;
+		routing_data->fe_cfg[i].ec = (struct q6adm_ec_ref) {
+			.port_id = -1, .channels = 1, .rate = 48000, .bit_width = 16,
+		};
 	}
 
 	return 0;
@@ -1125,6 +1257,8 @@ static const struct snd_soc_component_driver msm_soc_routing_component = {
 	.num_dapm_widgets = ARRAY_SIZE(msm_qdsp6_widgets),
 	.dapm_routes = intercon,
 	.num_dapm_routes = ARRAY_SIZE(intercon),
+	.controls = q6routing_fe_adm_controls,
+	.num_controls = ARRAY_SIZE(q6routing_fe_adm_controls),
 	.read = q6routing_reg_read,
 	.write = q6routing_reg_write,
 };

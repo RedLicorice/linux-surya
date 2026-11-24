@@ -15,7 +15,19 @@ struct route_payload {
 	int port_id[MAX_COPPS_PER_PORT];
 };
 
+/* Echo reference for a capture COPP: endpoint 2 of ADM_CMD_DEVICE_OPEN_V6 */
+struct q6adm_ec_ref {
+	int port_id;		/* AFE DAI id of the reference port, or -1 for none */
+	int channels;
+	int rate;
+	int bit_width;
+};
+
 struct q6copp;
+struct q6copp *q6adm_open_ec(struct device *dev, int port_id, int path, int rate,
+			      int channel_mode, int topology, int perf_mode,
+			      uint16_t bit_width, int app_type, int acdb_id,
+			      const struct q6adm_ec_ref *ec);
 struct q6copp *q6adm_open(struct device *dev, int port_id, int path, int rate,
 			   int channel_mode, int topology, int perf_mode,
 			   uint16_t bit_width, int app_type, int acdb_id);
