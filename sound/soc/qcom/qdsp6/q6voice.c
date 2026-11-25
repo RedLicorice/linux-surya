@@ -18,6 +18,26 @@
 struct q6voice_path_runtime {
 	struct q6voice_session *sessions[Q6VOICE_SERVICE_COUNT];
 	unsigned int started;
+
+	/*
+	 * The module parameters as they were when this call started. They are
+	 * writable at runtime, and a call set up one way has to be taken down
+	 * the same way.
+	 */
+	int setup_level;
+	int cal_level;
+	bool attach_stream;
+
+	/*
+	 * Calibration lent through this call's MVM session. The handles
+	 * belong to that session and die with it, so they are returned and
+	 * freed with the session at the end of the call, and the next call
+	 * lends its own.
+	 */
+	struct q6voice_cal *stream_cal;	/* the stream's own */
+	struct q6voice_cal *dev_cfg;	/* what the endpoints are */
+	struct q6voice_cal *cal;	/* the vocproc, other than by step */
+	struct q6voice_cal *vol_cal;	/* the vocproc, per volume step */
 };
 
 struct q6voice_path {
@@ -34,12 +54,6 @@ struct q6voice {
 	struct device *dev;
 	/* cached so the version is queried once, not per call */
 	char cvd_version[32];
-	/* lent to the ADSP once and referred to by handle thereafter */
-	struct q6voice_cal *stream_cal;	/* the stream's own */
-	struct q6voice_cal *dev_cfg;	/* what the endpoints are */
-	struct q6voice_cal *cal;	/* the vocproc, other than by step */
-	struct q6voice_cal *vol_cal;	/* the vocproc, per volume step */
-	bool cal_tried;
 	/* Downlink volume step, applied at call start and whenever it changes */
 	unsigned int rx_volume_step;
 	struct q6voice_path paths[Q6VOICE_PATH_COUNT];
@@ -47,9 +61,9 @@ struct q6voice {
 
 /*
  * Calibration is per board, and the ADSP has to be lent it before it will
- * resolve a volume step. Loaded on the first call rather than at probe: the
- * MVM service has to be up to accept the memory, and it is not when q6voice
- * is created.
+ * resolve a volume step. Loaded at the start of every call rather than at
+ * probe: the memory is lent through the call's MVM session, which only exists
+ * for the length of the call.
  */
 /*
  * The three tables, in the order the vendor registers them: what the endpoints
@@ -57,11 +71,7 @@ struct q6voice {
  * step, then what does. A volume table is an overlay on a vocproc that has
  * already been told the first two, which is why the order is not incidental.
  */
-#define Q6VOICE_STREAM_CAL_FIRMWARE	"qcom/q6voice-stream-cal.bin"
-#define Q6VOICE_DEV_CFG_FIRMWARE	"qcom/q6voice-devcfg.bin"
-#define Q6VOICE_CAL_FIRMWARE		"qcom/q6voice-cal.bin"
-#define Q6VOICE_VOL_CAL_FIRMWARE	"qcom/q6voice-vol-cal.bin"
-#define Q6VOICE_CUSTOM_TOPOLOGY_FIRMWARE "qcom/apollo-avcs-custom-topologies.bin"
+/* The files are the board's: the calibration node's firmware-name list (q6voice-cal). */
 
 /*
  * Downlink volume for a call. Android's HAL maps the user-facing volume onto
@@ -92,29 +102,40 @@ static bool q6voice_cvp_create_v3(const char *cvd_version)
 }
 
 /*
- * Set once, by a driver that probes long before any call can start, and only
- * ever read from a path that is already serialized by its own mutex.
+ * Registered by the bridge driver, which can go away (unbind, module unload)
+ * while a call is being set up. The callbacks run under this mutex, and the
+ * bridge unregisters before tearing anything down, so once
+ * q6voice_set_modem_link(NULL) returns nothing is calling into it any more.
  */
+static DEFINE_MUTEX(q6voice_modem_link_lock);
 static const struct q6voice_modem_link *q6voice_modem_link;
 
 void q6voice_set_modem_link(const struct q6voice_modem_link *link)
 {
+	mutex_lock(&q6voice_modem_link_lock);
 	q6voice_modem_link = link;
+	mutex_unlock(&q6voice_modem_link_lock);
 }
 EXPORT_SYMBOL_GPL(q6voice_set_modem_link);
 
 static int q6voice_modem_link_start(void)
 {
-	if (!q6voice_modem_link)
-		return 0;
+	int ret = 0;
 
-	return q6voice_modem_link->start();
+	mutex_lock(&q6voice_modem_link_lock);
+	if (q6voice_modem_link)
+		ret = q6voice_modem_link->start();
+	mutex_unlock(&q6voice_modem_link_lock);
+
+	return ret;
 }
 
 static void q6voice_modem_link_end(void)
 {
+	mutex_lock(&q6voice_modem_link_lock);
 	if (q6voice_modem_link)
 		q6voice_modem_link->end();
+	mutex_unlock(&q6voice_modem_link_lock);
 }
 
 /*
@@ -152,16 +173,6 @@ enum {
 };
 
 /*
- * Re-read the calibration files at the start of every call rather than once.
- * Only useful while working out what the DSP will accept: it makes trying a
- * different file a matter of copying it, and the memory the last attempt was
- * lent went away with the session that lent it.
- */
-static bool cal_reload;
-module_param(cal_reload, bool, 0644);
-MODULE_PARM_DESC(cal_reload, "Re-read the calibration files on every call.");
-
-/*
  * Registering calibration is not optional on this board: without it the DSP
  * refuses the volume step (0x112c2) and the call is silent. It defaulted to
  * off while the table format was still being worked out.
@@ -197,14 +208,36 @@ module_param(attach_stream, bool, 0644);
 MODULE_PARM_DESC(attach_stream,
 		 "Attach the stream to the MVM from here instead of leaving it to the modem.");
 
+/* Return this call's calibration to the ADSP, while its MVM session lives. */
+static void q6voice_path_free_cal(struct q6voice_path *p)
+{
+	struct q6voice_path_runtime *rt = p->runtime;
+	struct q6voice_session *mvm = rt->sessions[Q6VOICE_SERVICE_MVM];
+
+	q6voice_cal_free(rt->stream_cal, mvm);
+	q6voice_cal_free(rt->dev_cfg, mvm);
+	q6voice_cal_free(rt->cal, mvm);
+	q6voice_cal_free(rt->vol_cal, mvm);
+	rt->stream_cal = NULL;
+	rt->dev_cfg = NULL;
+	rt->cal = NULL;
+	rt->vol_cal = NULL;
+}
+
 static int q6voice_path_start(struct q6voice_path *p)
 {
+	struct q6voice_path_runtime *rt = p->runtime;
 	struct device *dev = p->v->dev;
 	struct q6voice_session *mvm, *cvp, *cvs = NULL;
 	int ret;
 	u32 tx_topology, rx_topology;
 
-	dev_info(dev, "start path %d, setup level %d\n", p->type, setup_level);
+	rt->setup_level = READ_ONCE(setup_level);
+	rt->cal_level = READ_ONCE(cal_level);
+	rt->attach_stream = READ_ONCE(rt->attach_stream);
+
+	dev_info(dev, "start path %d, setup level %d\n", p->type,
+		 rt->setup_level);
 
 	/*
 	 * Where the modem is a separate chip it DMAs the call audio into system
@@ -234,7 +267,7 @@ static int q6voice_path_start(struct q6voice_path *p)
 	 * without one -- its modem is on the same die -- so it is the first
 	 * thing to drop when reproducing that driver exactly.
 	 */
-	if (setup_level < 2) {
+	if (rt->setup_level < 2) {
 		cvs = p->runtime->sessions[Q6VOICE_SERVICE_CVS];
 		if (!cvs) {
 			cvs = q6cvs_session_create(p->type);
@@ -262,7 +295,7 @@ static int q6voice_path_start(struct q6voice_path *p)
 		 * The modem owns the call, so the attach is its to make. Ours
 		 * is redundant on a merged session and is what starves it.
 		 */
-		if (attach_stream) {
+		if (rt->attach_stream) {
 			ret = q6mvm_attach_stream(mvm, cvs, true);
 			if (ret) {
 				dev_err(dev, "failed to attach stream to mvm: %d\n",
@@ -286,7 +319,7 @@ static int q6voice_path_start(struct q6voice_path *p)
 	 * before it creates the CVP session. Keep that ordering here so the
 	 * ADSP sees topology preload before any CVP state exists.
 	 */
-	if (setup_level == 0) {
+	if (rt->setup_level == 0) {
 		q6cvp_get_topologies(&tx_topology, &rx_topology);
 		if (tx_topology == VSS_IVOCPROC_TOPOLOGY_ID_NONE &&
 		    rx_topology == VSS_IVOCPROC_TOPOLOGY_ID_NONE)
@@ -300,18 +333,17 @@ static int q6voice_path_start(struct q6voice_path *p)
 		 * chosen topology really did need the blob, the vocproc create
 		 * that follows says so.
 		 */
-		ret = q6core_register_custom_topologies(
-			Q6VOICE_CUSTOM_TOPOLOGY_FIRMWARE);
+		ret = q6voice_cal_register_topologies();
 		if (ret)
 			dev_warn(dev, "custom topology registration failed: %d\n",
 				 ret);
 
 		dev_info(dev, "preload CVD topology modules tx %#010x rx %#010x\n",
 			 tx_topology, rx_topology);
-		ret = q6core_load_topo_modules(rx_topology);
+		ret = q6core_load_topology(rx_topology, true);
 		if (ret)
 			dev_warn(dev, "rx topology preload failed: %d\n", ret);
-		ret = q6core_load_topo_modules(tx_topology);
+		ret = q6core_load_topology(tx_topology, true);
 		if (ret)
 			dev_warn(dev, "tx topology preload failed: %d\n", ret);
 		ret = 0;
@@ -331,7 +363,7 @@ topology_ready:
 		p->runtime->sessions[Q6VOICE_SERVICE_CVP] = cvp;
 	}
 
-	if (setup_level > 0)
+	if (rt->setup_level > 0)
 		goto configured;
 
 	/*
@@ -375,46 +407,42 @@ topology_ready:
 	 * simply fails. Absent calibration is not an error -- the call
 	 * proceeds, and only the volume command notices.
 	 */
-	if (cal_level >= Q6VOICE_CAL_LEND && (!p->v->cal_tried || cal_reload)) {
-		q6voice_cal_free(p->v->stream_cal, mvm);
-		q6voice_cal_free(p->v->dev_cfg, mvm);
-		q6voice_cal_free(p->v->cal, mvm);
-		q6voice_cal_free(p->v->vol_cal, mvm);
+	if (rt->cal_level >= Q6VOICE_CAL_LEND) {
+		q6voice_path_free_cal(p);
 
-		p->v->cal_tried = true;
-		p->v->stream_cal = q6voice_cal_load(dev,
-						    Q6VOICE_STREAM_CAL_FIRMWARE,
-						    mvm);
-		p->v->dev_cfg = q6voice_cal_load(dev, Q6VOICE_DEV_CFG_FIRMWARE,
-						 mvm);
-		p->v->cal = q6voice_cal_load(dev, Q6VOICE_CAL_FIRMWARE, mvm);
-		p->v->vol_cal = q6voice_cal_load(dev, Q6VOICE_VOL_CAL_FIRMWARE,
-						 mvm);
+		rt->stream_cal = q6voice_cal_load(dev,
+				q6voice_cal_firmware(Q6VOICE_CAL_STREAM), mvm);
+		rt->dev_cfg = q6voice_cal_load(dev,
+				q6voice_cal_firmware(Q6VOICE_CAL_DEV_CFG), mvm);
+		rt->cal = q6voice_cal_load(dev,
+				q6voice_cal_firmware(Q6VOICE_CAL_VOCPROC), mvm);
+		rt->vol_cal = q6voice_cal_load(dev,
+				q6voice_cal_firmware(Q6VOICE_CAL_VOLUME), mvm);
 	}
 
-	if (cal_level >= Q6VOICE_CAL_REGISTER) {
+	if (rt->cal_level >= Q6VOICE_CAL_REGISTER) {
 		bool instance = q6voice_cvp_create_v3(p->v->cvd_version);
 
-		ret = q6voice_cal_register_stream(p->v->stream_cal, cvs,
+		ret = q6voice_cal_register_stream(rt->stream_cal, cvs,
 						  instance);
 		if (ret)
 			dev_warn(dev, "failed to register stream calibration: %d\n",
 				 ret);
 
-		if (!p->v->dev_cfg)
+		if (!rt->dev_cfg)
 			dev_warn(dev, "no device configuration to register\n");
 
-		ret = q6voice_cal_register_dev_cfg(p->v->dev_cfg, cvp);
+		ret = q6voice_cal_register_dev_cfg(rt->dev_cfg, cvp);
 		if (ret)
 			dev_warn(dev, "failed to register device config: %d\n",
 				 ret);
 
-		ret = q6voice_cal_register_cal(p->v->cal, cvp, instance);
+		ret = q6voice_cal_register_cal(rt->cal, cvp, instance);
 		if (ret)
 			dev_warn(dev, "failed to register calibration: %d\n",
 				 ret);
 
-		ret = q6voice_cal_register_vol(p->v->vol_cal, cvp, instance);
+		ret = q6voice_cal_register_vol(rt->vol_cal, cvp, instance);
 		if (ret)
 			dev_warn(dev, "failed to register volume calibration: %d\n",
 				 ret);
@@ -437,7 +465,7 @@ configured:
 	if (ret)
 		dev_warn(dev, "failed to disable TTY mode: %d\n", ret);
 
-	if (setup_level > 0)
+	if (rt->setup_level > 0)
 		goto started;
 
 
@@ -471,14 +499,19 @@ started:
 	 * before START_VOICE differs from that state transition even though the
 	 * DSP accepts the packets.
 	 */
-	if (setup_level == 0) {
+	if (rt->setup_level == 0) {
 		ret = q6cvp_set_device_mute(cvp, VSS_IVOLUME_DIRECTION_RX, false,
 					    Q6VOICE_MUTE_RAMP_MS);
 		if (ret)
 			dev_warn(dev, "failed to unmute rx device: %d\n", ret);
 	}
 
-	return ret;
+	/*
+	 * The call is running from here on: whatever failed above was only
+	 * warned about, and returning it would leave a started call that
+	 * q6voice_stop() never stops, with the modem link held awake.
+	 */
+	return 0;
 
 start_err:
 	q6mvm_start(mvm, false);
@@ -490,7 +523,7 @@ stream_err:
 	/* Nothing to detach if the setup level left it out, or if the attach
 	 * was left to the modem -- detaching then would tear down its attach.
 	 */
-	if (cvs && attach_stream)
+	if (cvs && rt->attach_stream)
 		q6mvm_attach_stream(mvm, cvs, false);
 link_err:
 	q6voice_modem_link_end();
@@ -504,7 +537,7 @@ int q6voice_start(struct q6voice *v, enum q6voice_path_type path, bool capture)
 
 	mutex_lock(&p->lock);
 	if (!p->runtime) {
-		p->runtime = kzalloc(sizeof(*p), GFP_KERNEL);
+		p->runtime = kzalloc(sizeof(*p->runtime), GFP_KERNEL);
 		if (!p->runtime) {
 			ret = -ENOMEM;
 			goto out;
@@ -558,7 +591,7 @@ static void q6voice_path_stop(struct q6voice_path *p)
 		dev_err(dev, "failed to disable cvp: %d\n", ret);
 
 	/* Only undo an attach we made ourselves; see attach_stream above. */
-	if (cvs && attach_stream) {
+	if (cvs && p->runtime->attach_stream) {
 		ret = q6mvm_attach_stream(mvm, cvs, false);
 		if (ret)
 			dev_err(dev, "failed to detach stream from mvm: %d\n", ret);
@@ -571,6 +604,9 @@ static void q6voice_path_destroy(struct q6voice_path *p)
 {
 	struct q6voice_path_runtime *runtime = p->runtime;
 	enum q6voice_service_type svc;
+
+	/* the handles are the MVM session's: return them before it goes */
+	q6voice_path_free_cal(p);
 
 	for (svc = 0; svc < Q6VOICE_SERVICE_COUNT; ++svc) {
 		if (runtime->sessions[svc])
@@ -625,11 +661,6 @@ static void q6voice_free(void *data)
 		mutex_unlock(&p->lock);
 		mutex_destroy(&p->lock);
 	}
-
-	q6voice_cal_free(v->stream_cal, NULL);
-	q6voice_cal_free(v->dev_cfg, NULL);
-	q6voice_cal_free(v->cal, NULL);
-	q6voice_cal_free(v->vol_cal, NULL);
 }
 
 /*

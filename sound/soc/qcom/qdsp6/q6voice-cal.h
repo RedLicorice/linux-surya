@@ -8,6 +8,19 @@ struct device;
 struct q6voice_cal;
 struct q6voice_session;
 
+/* the order of the calibration node's firmware-name list */
+enum q6voice_cal_file {
+	Q6VOICE_CAL_STREAM,	/* the stream's own */
+	Q6VOICE_CAL_DEV_CFG,	/* what the endpoints are */
+	Q6VOICE_CAL_VOCPROC,	/* the vocproc, other than by step */
+	Q6VOICE_CAL_VOLUME,	/* the vocproc, per volume step */
+	Q6VOICE_CAL_TOPOLOGIES,	/* the board's AVCS custom topologies */
+	Q6VOICE_CAL_FILE_COUNT,
+};
+
+const char *q6voice_cal_firmware(enum q6voice_cal_file file);
+int q6voice_cal_register_topologies(void);
+
 /*
  * Returns NULL when no calibration is installed for the board, which callers
  * should treat as "carry on without it" rather than as a failure.

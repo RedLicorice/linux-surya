@@ -90,11 +90,16 @@ struct q6voice_modem_link {
 	void (*end)(void);
 };
 
+/*
+ * The callbacks are serialized, and registering NULL waits for one that is
+ * running: after that the bridge may free what they use.
+ */
 void q6voice_set_modem_link(const struct q6voice_modem_link *link);
 
 /*
  * Called each time a service becomes usable, including after an ADSP restart,
- * from a context that may send to it.
+ * from a context that may send to it. Registering NULL waits for a notifier
+ * that is running.
  */
 void q6voice_common_set_svc_notifier(void (*notify)(enum q6voice_service_type));
 

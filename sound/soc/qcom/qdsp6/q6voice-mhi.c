@@ -135,7 +135,10 @@ DEFINE_SHOW_ATTRIBUTE(q6voice_mhi_config);
 
 /*
  * The platform device and the MHI device show up independently and in no fixed
- * order, so the two halves rendezvous through this.
+ * order, so the two halves rendezvous through this. Set before, and cleared
+ * after, everything that reads it is registered (the modem link, the service
+ * notifier, the MHI driver), and those unregister synchronously: nothing can
+ * see a context that is being freed.
  */
 static struct q6voice_mhi *q6voice_mhi_ctx;
 
@@ -446,6 +449,17 @@ static struct mhi_driver q6voice_mhi_driver = {
 	},
 };
 
+/* Held for the device's lifetime; see q6voice_mhi_probe(). */
+static void q6voice_mhi_unmap_guard(struct q6voice_mhi *ctx)
+{
+	if (!ctx->iova_guard)
+		return;
+
+	dma_unmap_resource(ctx->adsp_dev, ctx->iova_guard, PAGE_SIZE,
+			   DMA_BIDIRECTIONAL, 0);
+	ctx->iova_guard = 0;
+}
+
 static int q6voice_mhi_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -518,8 +532,19 @@ static int q6voice_mhi_probe(struct platform_device *pdev)
 	ctx->iova_adsp = dma_map_resource(dev, ctx->phys, VOICE_MAILBOX_SIZE,
 					  DMA_BIDIRECTIONAL, 0);
 	if (dma_mapping_error(dev, ctx->iova_adsp)) {
+		q6voice_mhi_unmap_guard(ctx);
 		return dev_err_probe(dev, -ENOMEM,
 				     "failed to map mailbox for the ADSP\n");
+	}
+
+	/* the stream id rides above bit 32: the mailbox must end below it */
+	if ((u64)ctx->iova_adsp + VOICE_MAILBOX_SIZE >= SZ_4G) {
+		dma_unmap_resource(dev, ctx->iova_adsp, VOICE_MAILBOX_SIZE,
+				   DMA_BIDIRECTIONAL, 0);
+		q6voice_mhi_unmap_guard(ctx);
+		return dev_err_probe(dev, -ERANGE,
+				     "mailbox mapped at %pad, past 4 GiB\n",
+				     &ctx->iova_adsp);
 	}
 
 	platform_set_drvdata(pdev, ctx);
@@ -550,9 +575,11 @@ err_unregister:
 	q6voice_common_set_svc_notifier(NULL);
 	q6voice_set_modem_link(NULL);
 	debugfs_remove_recursive(ctx->debugfs);
+	cancel_work_sync(&ctx->reconfig);
 	q6voice_mhi_ctx = NULL;
 	dma_unmap_resource(dev, ctx->iova_adsp, VOICE_MAILBOX_SIZE,
 			   DMA_BIDIRECTIONAL, 0);
+	q6voice_mhi_unmap_guard(ctx);
 	return ret;
 }
 
@@ -571,9 +598,10 @@ static void q6voice_mhi_remove(struct platform_device *pdev)
 	q6voice_mhi_unmap_pcie(ctx);
 	mutex_unlock(&ctx->lock);
 
+	q6voice_mhi_ctx = NULL;
 	dma_unmap_resource(ctx->adsp_dev, ctx->iova_adsp,
 			   VOICE_MAILBOX_SIZE, DMA_BIDIRECTIONAL, 0);
-	q6voice_mhi_ctx = NULL;
+	q6voice_mhi_unmap_guard(ctx);
 }
 
 static const struct of_device_id q6voice_mhi_device_id[] = {

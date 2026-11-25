@@ -189,6 +189,16 @@ static const struct snd_kcontrol_new quinary_tdm_rx_0_mixer_controls[] = {
 		       q6voice_get_mixer, q6voice_put_mixer)
 };
 
+/*
+ * SoundWire based SoCs drive the handset earpiece from the WCD codec through
+ * the LPASS codec DMA RX port (Xiaomi Mi 10: WCD938x EAR on RX_CODEC_DMA_RX_0,
+ * the stock "handset" path), so the downlink is selectable there too.
+ */
+static const struct snd_kcontrol_new rx_codec_dma_rx_0_mixer_controls[] = {
+	SOC_SINGLE_EXT("CS-Voice", RX_CODEC_DMA_RX_0, 0, 1, 0,
+		       q6voice_get_mixer, q6voice_put_mixer)
+};
+
 static const struct snd_soc_dapm_widget q6voice_dapm_widgets[] = {
 	SND_SOC_DAPM_AIF_IN("CS-VOICE_DL1", "CS-VOICE Playback", 0, SND_SOC_NOPM, 0, 0),
 	SND_SOC_DAPM_AIF_OUT("CS-VOICE_UL1", "CS-VOICE Capture", 0, SND_SOC_NOPM, 0, 0),
@@ -225,6 +235,9 @@ static const struct snd_soc_dapm_widget q6voice_dapm_widgets[] = {
 	SND_SOC_DAPM_MIXER("QUIN_TDM_RX_0 Voice Mixer", SND_SOC_NOPM, 0, 0,
 			   quinary_tdm_rx_0_mixer_controls,
 			   ARRAY_SIZE(quinary_tdm_rx_0_mixer_controls)),
+	SND_SOC_DAPM_MIXER("RX_CODEC_DMA_RX_0 Voice Mixer", SND_SOC_NOPM, 0, 0,
+			   rx_codec_dma_rx_0_mixer_controls,
+			   ARRAY_SIZE(rx_codec_dma_rx_0_mixer_controls)),
 };
 
 static const struct snd_soc_dapm_route q6voice_dapm_routes[] = {
@@ -258,6 +271,9 @@ static const struct snd_soc_dapm_route q6voice_dapm_routes[] = {
 	{ "TERT_TDM_RX_0",		NULL,	"TERT_TDM_RX_0 Voice Mixer" },
 	{ "QUAT_TDM_RX_0",		NULL,	"QUAT_TDM_RX_0 Voice Mixer" },
 	{ "QUIN_TDM_RX_0",		NULL,	"QUIN_TDM_RX_0 Voice Mixer" },
+
+	{ "RX_CODEC_DMA_RX_0 Voice Mixer", "CS-Voice",	"CS-VOICE_DL1" },
+	{ "RX_CODEC_DMA_RX_0",		NULL,	"RX_CODEC_DMA_RX_0 Voice Mixer" },
 };
 
 static unsigned int q6voice_reg_read(struct snd_soc_component *component,

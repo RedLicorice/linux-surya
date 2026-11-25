@@ -38,8 +38,10 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include "q6core.h"
 #include "q6cvs.h"
 #include "q6mvm.h"
 #include "q6voice-common.h"
@@ -80,6 +82,80 @@ struct q6voice_cal {
  * calibration is loaded lazily from the call path, which runs elsewhere.
  */
 static struct device *q6voice_cal_dev;
+
+/*
+ * The board's calibration files, from the node's firmware-name list in the
+ * order of enum q6voice_cal_file; a missing or empty entry means none.
+ */
+static const char *q6voice_cal_names[Q6VOICE_CAL_FILE_COUNT];
+static bool q6voice_cal_topologies_registered;
+static DEFINE_MUTEX(q6voice_cal_topologies_lock);
+
+const char *q6voice_cal_firmware(enum q6voice_cal_file file)
+{
+	if (file >= Q6VOICE_CAL_FILE_COUNT || !q6voice_cal_names[file] ||
+	    !*q6voice_cal_names[file])
+		return NULL;
+
+	return q6voice_cal_names[file];
+}
+EXPORT_SYMBOL_GPL(q6voice_cal_firmware);
+
+/*
+ * The board's own AVCS topologies (Android sends them as
+ * CORE_CUSTOM_TOPOLOGIES_CAL_TYPE before CVD loads OEM topology ids). Placed in
+ * this device's domain, the one the ADSP reads calibration through, and handed
+ * to the core service once per boot.
+ */
+int q6voice_cal_register_topologies(void)
+{
+	const char *name = q6voice_cal_firmware(Q6VOICE_CAL_TOPOLOGIES);
+	const struct firmware *fw;
+	struct device *dev = q6voice_cal_dev;
+	dma_addr_t iova;
+	size_t size;
+	void *buf;
+	int ret;
+
+	if (!name)
+		return 0;
+	if (!dev)
+		return -ENODEV;
+
+	mutex_lock(&q6voice_cal_topologies_lock);
+	if (q6voice_cal_topologies_registered) {
+		ret = 0;
+		goto out;
+	}
+
+	ret = request_firmware(&fw, name, dev);
+	if (ret)
+		goto out;
+
+	size = PAGE_ALIGN(fw->size);
+	buf = fw->size ? dma_alloc_coherent(dev, size, &iova, GFP_KERNEL) : NULL;
+	if (!buf) {
+		ret = fw->size ? -ENOMEM : -EINVAL;
+		release_firmware(fw);
+		goto out;
+	}
+	memcpy(buf, fw->data, fw->size);
+
+	ret = q6core_register_topologies(q6voice_dsp_address(dev, iova),
+					 fw->size);
+	if (!ret) {
+		q6voice_cal_topologies_registered = true;
+		dev_info(dev, "registered %zu bytes of custom topologies from %s\n",
+			 fw->size, name);
+	}
+
+	dma_free_coherent(dev, size, buf, iova);
+	release_firmware(fw);
+out:
+	mutex_unlock(&q6voice_cal_topologies_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(q6voice_cal_register_topologies);
 
 /*
  * What the ADSP expects to find at the address given to
@@ -144,11 +220,13 @@ EXPORT_SYMBOL_GPL(q6voice_cal_free);
  * to the DSP exactly as they are stored, and only the count is worth checking.
  */
 #define Q6VOICE_CAL_COLUMN		12
+/* far more than any table the calibration library produces */
+#define Q6VOICE_CAL_MAX_COLUMNS		64
 
 static void *q6voice_cal_columns(struct device *dev, const void *src,
 				 u32 src_size, u32 *col_size)
 {
-	u32 columns;
+	u32 columns, expected;
 	void *out;
 
 	/*
@@ -166,7 +244,10 @@ static void *q6voice_cal_columns(struct device *dev, const void *src,
 		return NULL;
 
 	columns = get_unaligned_le32(src);
-	if (src_size != sizeof(__le32) + columns * Q6VOICE_CAL_COLUMN) {
+	if (columns > Q6VOICE_CAL_MAX_COLUMNS ||
+	    check_mul_overflow(columns, (u32)Q6VOICE_CAL_COLUMN, &expected) ||
+	    check_add_overflow(expected, (u32)sizeof(__le32), &expected) ||
+	    src_size != expected) {
 		dev_err(dev, "%u columns do not fit in %u bytes of them\n",
 			columns, src_size);
 		return NULL;
@@ -194,7 +275,7 @@ struct q6voice_cal *q6voice_cal_load(struct device *dev, const char *name,
 	 * No device means no stream id to allocate against, and an address the
 	 * ADSP cannot translate is worse than no calibration at all.
 	 */
-	if (!q6voice_cal_dev)
+	if (!q6voice_cal_dev || !name)
 		return NULL;
 
 	dev = q6voice_cal_dev;
@@ -218,8 +299,14 @@ struct q6voice_cal *q6voice_cal_load(struct device *dev, const char *name,
 
 	col_size = le32_to_cpu(hdr->col_size);
 	data_size = le32_to_cpu(hdr->data_size);
-	if (sizeof(*hdr) + col_size + data_size > fw->size) {
+	if ((size_t)col_size + data_size > fw->size - sizeof(*hdr)) {
 		dev_err(dev, "%s: truncated\n", name);
+		goto err_release;
+	}
+
+	/* a table with nothing in it would lend the ADSP an empty block */
+	if (!data_size) {
+		dev_err(dev, "%s: no calibration data\n", name);
 		goto err_release;
 	}
 
@@ -345,7 +432,13 @@ EXPORT_SYMBOL_GPL(q6voice_cal_register_dev_cfg);
 static int q6voice_cal_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	int ret;
+	int ret, n;
+
+	n = of_property_read_string_array(dev->of_node, "firmware-name",
+					  q6voice_cal_names,
+					  Q6VOICE_CAL_FILE_COUNT);
+	if (n < 0 && n != -EINVAL)
+		return dev_err_probe(dev, n, "bad firmware-name\n");
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
@@ -367,6 +460,8 @@ static int q6voice_cal_probe(struct platform_device *pdev)
 static void q6voice_cal_remove(struct platform_device *pdev)
 {
 	q6voice_cal_dev = NULL;
+	memset(q6voice_cal_names, 0, sizeof(q6voice_cal_names));
+	q6voice_cal_topologies_registered = false;
 }
 
 static const struct of_device_id q6voice_cal_device_id[] = {
@@ -387,4 +482,3 @@ module_platform_driver(q6voice_cal_platform_driver);
 
 MODULE_DESCRIPTION("Q6Voice calibration");
 MODULE_LICENSE("GPL v2");
-MODULE_FIRMWARE("qcom/q6voice-vol-cal.bin");
