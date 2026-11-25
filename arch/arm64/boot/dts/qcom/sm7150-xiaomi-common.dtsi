@@ -96,6 +96,9 @@
 			record-size = <0x80000>;
 			pmsg-size = <0x200000>;
 			console-size = <0x100000>;
+			/* the records survive a warm reset with bit errors (the 2026-11-24 hard lockup's console came back
+			 * garbled): Reed-Solomon parity per 16 bytes, as UMI's ramoops */
+			ecc-size = <16>;
 		};
 
 		ramdump_fb_mem: ramdump_fb_region@af000000 {
