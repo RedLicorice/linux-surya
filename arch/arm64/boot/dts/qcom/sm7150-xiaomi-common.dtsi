@@ -93,7 +93,9 @@
 			compatible = "ramoops";
 			reg = <0x0 0x9d800000 0x0 0x400000>;
 
-			record-size = <0x80000>;
+			/* one kernel log dump per record: 64 KiB, the size of pstore.kmsg_bytes (the device package's kernel
+			 * command line), so an oops with the log before it fits one record; 1 MiB of dumps = 16 records */
+			record-size = <0x10000>;
 			pmsg-size = <0x200000>;
 			console-size = <0x100000>;
 			/* the records survive a warm reset with bit errors (the 2026-11-24 hard lockup's console came back
