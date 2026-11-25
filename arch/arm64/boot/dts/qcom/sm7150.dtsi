@@ -2567,12 +2567,23 @@
 					#address-cells = <1>;
 					#size-cells = <0>;
 
-					service@3 {
+					q6core: service@3 {
 						compatible = "qcom,q6core";
 						reg = <APR_SVC_ADSP_CORE>;
 
 						qcom,protection-domain = "avs/audio",
 									 "msm/adsp/audio_pd";
+
+						/*
+						 * The board's custom topologies (its vendor
+						 * ACDB, firmware-name), registered at every
+						 * ADSP start; the stream the DSP reads them
+						 * through, as q6asm-dais'.
+						 */
+						q6coretopologies: topologies {
+							compatible = "qcom,q6core-topologies";
+							iommus = <&apps_smmu 0x1b21 0x0>;
+						};
 					};
 
 					q6afe: service@4 {
@@ -2630,7 +2641,7 @@
 					/*
 					 * Voice services for modem calls (out-of-tree q6voice
 					 * driver). Left disabled here: a board enables them
-					 * together with a VoiceMMode1 dai-link.
+					 * together with a CS-VOICE dai-link.
 					 */
 					q6mvm: service@9 {
 						compatible = "qcom,q6mvm";
@@ -2643,9 +2654,17 @@
 
 						q6voicedai: dais {
 							compatible = "qcom,q6voice-dais";
-							#address-cells = <1>;
-							#size-cells = <0>;
-							#sound-dai-cells = <1>;
+							#sound-dai-cells = <0>;
+						};
+
+						/*
+						 * The call's calibration, lent to the DSP in
+						 * the audio stream; firmware-name: the board's
+						 * calibration directory.
+						 */
+						q6voicecal: calibration {
+							compatible = "qcom,q6voice-cal";
+							iommus = <&apps_smmu 0x1b21 0x0>;
 						};
 					};
 

@@ -183,18 +183,20 @@
 		 * Modem call audio: a hostless frontend on the Q6 voice
 		 * services. The DSP mixes the call itself; opening this PCM
 		 * (both directions, 8 kHz mono, never started) only starts the
-		 * backends it is routed to with the "VoiceMMode1 Capture Mixer"
+		 * backends it is routed to with the "CS-Voice Capture Mixer"
 		 * and "<port> Voice Mixer" controls, which then carry the call.
+		 * The DAI is CS-VOICE; the session it builds is VoiceMMode1's
+		 * (VSID 0x11c05000), the one the integrated modem joins.
 		 *
 		 * It is the fifth link on purpose: PCM numbers follow the link
 		 * order, and q6voiced opens hw:0,4. Keep it here (or change
 		 * q6voiced's argument) when links are added or moved.
 		 */
-		voicemmode1-dai-link {
-			link-name = "VoiceMMode1";
+		cs-voice-dai-link {
+			link-name = "CS-VOICE";
 
 			cpu {
-				sound-dai = <&q6voicedai VOICEMMODE1>;
+				sound-dai = <&q6voicedai>;
 			};
 		};
 
@@ -886,10 +888,13 @@
 	status = "okay";
 };
 
-&q6voicedai {
-	dai@1 {
-		reg = <VOICEMMODE1>;
-	};
+/* the call's calibration (ACDB device pairs: the UCM's) and the board's custom topologies, from its vendor ACDB */
+&q6voicecal {
+	firmware-name = "qcom/sm7150/surya/voice";
+};
+
+&q6coretopologies {
+	firmware-name = "qcom/sm7150/surya/Global_cal.acdb";
 };
 
 &remoteproc_adsp {
