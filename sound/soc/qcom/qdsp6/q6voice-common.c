@@ -2,6 +2,8 @@
 // Copyright (c) 2020, Stephan Gerhold
 
 #include <linux/module.h>
+#include <linux/of.h>
+#include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/soc/qcom/apr.h>
@@ -9,7 +11,13 @@
 
 #define APRV2_IBASIC_CMD_DESTROY_SESSION	0x0001003C
 
-#define TIMEOUT_MS	300
+/*
+ * Long enough for this SoC. Qualcomm's own tree waits 300 ms everywhere except
+ * on sm8250, where the vendor raises it to a second because the ADSP here is
+ * slow to answer; a command that is merely late otherwise comes back as a
+ * timeout and is indistinguishable from one the ADSP refused.
+ */
+#define TIMEOUT_MS	1000
 
 struct q6voice_service {
 	struct apr_device *adev;
@@ -18,11 +26,72 @@ struct q6voice_service {
 	/* Protect sessions array */
 	spinlock_t lock;
 	struct q6voice_session *sessions[Q6VOICE_PATH_COUNT];
+
+	/*
+	 * Slot for a command addressed to the service itself rather than to a
+	 * session. Only one may be outstanding, which is enough: these are
+	 * one-off configuration commands issued outside the call path.
+	 */
+	struct mutex svc_lock;
+	wait_queue_head_t svc_wait;
+	u32 svc_expected_opcode;
+	u32 svc_result;
+
+	/* for replies that carry a payload instead of a basic result */
+	u32 svc_rsp_opcode;
+	void *svc_rsp;
+	u32 svc_rsp_size;
 };
 
 /* Protect q6voice_services */
 static DEFINE_SPINLOCK(q6voice_services_lock);
-static struct q6voice_service *q6voice_services[Q6VOICE_SERVICE_COUNT];
+static struct q6voice_service *q6voice_services[Q6VOICE_SERVICE_COUNT] = {0};
+
+/*
+ * The ADSP can restart under us -- it has its own watchdog, and userspace can
+ * ask for it. Its APR services disappear and come back when that happens, and
+ * anything the ADSP was told before is gone with them: it comes back knowing
+ * nothing about, say, where the voice mailbox lives. Drivers that configured
+ * something once at probe need to hear about it so they can say it again.
+ */
+static void (*q6voice_svc_notifier)(enum q6voice_service_type type);
+
+void q6voice_common_set_svc_notifier(void (*notify)(enum q6voice_service_type))
+{
+	q6voice_svc_notifier = notify;
+}
+EXPORT_SYMBOL_GPL(q6voice_common_set_svc_notifier);
+
+/*
+ * Addresses handed to the DSP are not bare addresses. The DSP maps them
+ * through the SMMU itself, so it has to be told which stream to translate
+ * against, and that is carried in the top half of the address: the low bits of
+ * this device's stream id, shifted up out of the way of the address proper.
+ *
+ * Sending a bare address means the DSP translates against stream zero, maps
+ * whatever that lands on, and reads it. On this SoC that resets the board.
+ *
+ * The mask is the vendor's, and is the same across every SoC in that tree; it
+ * is the part of the stream id that selects the context bank.
+ */
+#define Q6VOICE_SMMU_SID_MASK		0xf
+#define Q6VOICE_SMMU_SID_SHIFT		32
+
+u64 q6voice_dsp_address(struct device *dev, dma_addr_t addr)
+{
+	struct of_phandle_args args;
+	u64 sid = 0;
+
+	if (!of_parse_phandle_with_args(dev->of_node, "iommus", "#iommu-cells",
+					0, &args)) {
+		if (args.args_count)
+			sid = args.args[0] & Q6VOICE_SMMU_SID_MASK;
+		of_node_put(args.np);
+	}
+
+	return addr | (sid << Q6VOICE_SMMU_SID_SHIFT);
+}
+EXPORT_SYMBOL_GPL(q6voice_dsp_address);
 
 int q6voice_common_probe(struct apr_device *adev, enum q6voice_service_type type)
 {
@@ -40,6 +109,8 @@ int q6voice_common_probe(struct apr_device *adev, enum q6voice_service_type type
 	svc->adev = adev;
 	svc->type = type;
 	spin_lock_init(&svc->lock);
+	mutex_init(&svc->svc_lock);
+	init_waitqueue_head(&svc->svc_wait);
 
 	dev_set_drvdata(dev, svc);
 
@@ -49,7 +120,14 @@ int q6voice_common_probe(struct apr_device *adev, enum q6voice_service_type type
 		q6voice_services[type] = svc;
 	spin_unlock_irqrestore(&q6voice_services_lock, flags);
 
-	return current_svc ? -EEXIST : 0;
+	if (current_svc)
+		return -EEXIST;
+
+	/* Announce it only once it can actually be sent to. */
+	if (q6voice_svc_notifier)
+		q6voice_svc_notifier(type);
+
+	return 0;
 }
 EXPORT_SYMBOL_GPL(q6voice_common_probe);
 
@@ -78,7 +156,7 @@ static void q6voice_session_free(struct kref *ref)
 
 static int q6voice_session_destroy(struct q6voice_session *s)
 {
-	struct apr_pkt cmd = { };
+	struct apr_pkt cmd;
 
 	cmd.hdr.pkt_size = APR_HDR_SIZE;
 	cmd.hdr.opcode = APRV2_IBASIC_CMD_DESTROY_SESSION;
@@ -118,7 +196,7 @@ q6voice_session_create(enum q6voice_service_type type,
 	if (!svc)
 		return ERR_PTR(-ENODEV);
 
-	s = kzalloc_obj(*s, GFP_KERNEL);
+	s = kzalloc(sizeof(*s), GFP_KERNEL);
 	if (!s)
 		return ERR_PTR(-ENOMEM);
 
@@ -197,6 +275,105 @@ static void q6voice_session_callback(struct q6voice_session *s,
 	wake_up(&s->wait);
 }
 
+/*
+ * Send a command whose reply comes back to the service rather than to a
+ * session. @dest_port selects what inside the ADSP is being addressed: zero
+ * for the service itself, as the mailbox configuration uses, or a session
+ * handle for commands that belong to an existing session even though their
+ * reply carries its own payload. @size is the full packet size including the
+ * header.
+ */
+static int q6voice_send_svc(enum q6voice_service_type type, struct apr_hdr *hdr,
+			    u32 size, u16 dest_port, u32 rsp_opcode, void *rsp,
+			    u32 rsp_size)
+{
+	struct q6voice_service *svc;
+	unsigned long flags;
+	int ret;
+
+	if (type >= Q6VOICE_SERVICE_COUNT)
+		return -EINVAL;
+
+	spin_lock_irqsave(&q6voice_services_lock, flags);
+	svc = q6voice_services[type];
+	spin_unlock_irqrestore(&q6voice_services_lock, flags);
+	if (!svc)
+		return -ENODEV;
+
+	hdr->hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
+				       APR_HDR_LEN(APR_HDR_SIZE), APR_PKT_VER);
+	hdr->pkt_size = size;
+	hdr->src_port = Q6VOICE_SVC_PORT;
+	hdr->dest_port = dest_port;
+	hdr->token = 0;
+
+	mutex_lock(&svc->svc_lock);
+
+	svc->svc_expected_opcode = hdr->opcode;
+	svc->svc_result = 0;
+	svc->svc_rsp_opcode = rsp_opcode;
+	svc->svc_rsp = rsp;
+	svc->svc_rsp_size = rsp_size;
+
+	ret = apr_send_pkt(svc->adev, (struct apr_pkt *)hdr);
+	if (ret < 0)
+		goto out;
+
+	ret = wait_event_timeout(svc->svc_wait, (svc->svc_expected_opcode == 0),
+				 msecs_to_jiffies(TIMEOUT_MS));
+	if (!ret) {
+		svc->svc_expected_opcode = 0;
+		ret = -ETIMEDOUT;
+		goto out;
+	}
+
+	if (svc->svc_result > 0) {
+		dev_err(&svc->adev->dev, "command %#x failed with error %d\n",
+			hdr->opcode, svc->svc_result);
+		ret = -EIO;
+		goto out;
+	}
+
+	ret = 0;
+out:
+	svc->svc_rsp_opcode = 0;
+	svc->svc_rsp = NULL;
+	mutex_unlock(&svc->svc_lock);
+	return ret;
+}
+
+int q6voice_common_send_svc(enum q6voice_service_type type, struct apr_hdr *hdr,
+			    u32 size)
+{
+	return q6voice_send_svc(type, hdr, size, 0, 0, NULL, 0);
+}
+EXPORT_SYMBOL_GPL(q6voice_common_send_svc);
+
+int q6voice_common_send_svc_rsp(enum q6voice_service_type type,
+				struct apr_hdr *hdr, u32 size, u32 rsp_opcode,
+				void *rsp, u32 rsp_size)
+{
+	return q6voice_send_svc(type, hdr, size, 0, rsp_opcode, rsp, rsp_size);
+}
+EXPORT_SYMBOL_GPL(q6voice_common_send_svc_rsp);
+
+/*
+ * As above, but addressed to a session. Lending the ADSP memory is such a
+ * command: it belongs to the MVM session, yet answers with a handle of its own
+ * rather than a plain result. Addressing it to the service instead leaves the
+ * ADSP with a command for nothing in particular, and it stops answering
+ * altogether.
+ */
+int q6voice_common_send_svc_rsp_port(enum q6voice_service_type type,
+				     struct apr_hdr *hdr, u32 size,
+				     u16 dest_port, u32 rsp_opcode, void *rsp,
+				     u32 rsp_size)
+{
+	return q6voice_send_svc(type, hdr, size, dest_port, rsp_opcode, rsp,
+				rsp_size);
+}
+EXPORT_SYMBOL_GPL(q6voice_common_send_svc_rsp_port);
+
 int q6voice_common_callback(struct apr_device *adev, const struct apr_resp_pkt *data)
 {
 	struct device *dev = &adev->dev;
@@ -205,6 +382,41 @@ int q6voice_common_callback(struct apr_device *adev, const struct apr_resp_pkt *
 	unsigned long flags;
 
 	dev_dbg(dev, "callback: %#x\n", data->hdr.opcode);
+
+	/* Reply to a service-level command rather than to a session */
+	if (data->hdr.dest_port == Q6VOICE_SVC_PORT) {
+		struct aprv2_ibasic_rsp_result_t *result = data->payload;
+
+		/* a reply carrying its own payload, e.g. a version string */
+		if (v->svc_rsp_opcode &&
+		    data->hdr.opcode == v->svc_rsp_opcode) {
+			if (v->svc_rsp)
+				memcpy(v->svc_rsp, data->payload,
+				       min(v->svc_rsp_size,
+					   (u32)data->hdr.pkt_size));
+			v->svc_result = 0;
+			v->svc_expected_opcode = 0;
+			wake_up(&v->svc_wait);
+			return 0;
+		}
+
+		if (data->hdr.opcode != APR_BASIC_RSP_RESULT)
+			return 0;
+
+		dev_dbg(dev, "svc result: opcode %#x, status: %#x\n",
+			result->opcode, result->status);
+
+		if (result->opcode != v->svc_expected_opcode) {
+			dev_warn(dev, "unexpected svc reply for opcode %#x\n",
+				 result->opcode);
+			return 0;
+		}
+
+		v->svc_result = result->status;
+		v->svc_expected_opcode = 0;
+		wake_up(&v->svc_wait);
+		return 0;
+	}
 
 	if (data->hdr.dest_port >= Q6VOICE_PATH_COUNT) {
 		dev_warn(dev, "callback() called for unhandled/invalid path: %d\n",
@@ -230,6 +442,44 @@ int q6voice_common_callback(struct apr_device *adev, const struct apr_resp_pkt *
 }
 EXPORT_SYMBOL_GPL(q6voice_common_callback);
 
+/*
+ * Every command to the DSP passes through here, so this is the one place a
+ * whole call's conversation can be seen in order. Off by default: it is a line
+ * per command at a point where a call is being set up, and only useful when
+ * comparing the sequence against a working one.
+ */
+static bool trace;
+module_param(trace, bool, 0644);
+MODULE_PARM_DESC(trace, "Log every command sent to the DSP and its result.");
+
+static const char *q6voice_service_name(enum q6voice_service_type type)
+{
+	switch (type) {
+	case Q6VOICE_SERVICE_MVM:
+		return "MVM";
+	case Q6VOICE_SERVICE_CVP:
+		return "CVP";
+	case Q6VOICE_SERVICE_CVS:
+		return "CVS";
+	default:
+		return "???";
+	}
+}
+
+static void q6voice_trace(struct q6voice_session *s, struct apr_hdr *hdr,
+			  int ret)
+{
+	if (!trace)
+		return;
+
+	dev_info(s->dev,
+		 "%s opcode %#010x src %#06x dst %#06x size %u -> %s (%u)\n",
+		 q6voice_service_name(s->svc->type), hdr->opcode, hdr->src_port,
+		 hdr->dest_port, hdr->pkt_size,
+		 ret == -ETIMEDOUT ? "timeout" : ret ? "failed" : "ok",
+		 s->result);
+}
+
 int q6voice_common_send(struct q6voice_session *s, struct apr_hdr *hdr)
 {
 	unsigned long flags;
@@ -254,8 +504,11 @@ int q6voice_common_send(struct q6voice_session *s, struct apr_hdr *hdr)
 				 msecs_to_jiffies(TIMEOUT_MS));
 	if (!ret) {
 		s->expected_opcode = 0;
+		q6voice_trace(s, hdr, -ETIMEDOUT);
 		return -ETIMEDOUT;
 	}
+
+	q6voice_trace(s, hdr, s->result ? -EIO : 0);
 
 	if (s->result > 0) {
 		dev_err(s->dev, "command %#x failed with error %d\n",
@@ -267,36 +520,6 @@ int q6voice_common_send(struct q6voice_session *s, struct apr_hdr *hdr)
 }
 EXPORT_SYMBOL_GPL(q6voice_common_send);
 
-#define VSS_IVOLUME_CMD_MUTE_V2		0x0001138B
-#define VSS_IVOLUME_DIRECTION_TX	0
-#define VSS_IVOLUME_DIRECTION_RX	1
-
-struct vss_ivolume_cmd_mute_v2_cmd {
-	struct apr_hdr hdr;
-	u16 direction;
-	u16 mute_flag;
-	u16 ramp_duration_ms;
-} __packed;
-
-/*
- * Mute or unmute one direction of a vocproc (CVP, the device) or a stream
- * (CVS). Downstream sends both for TX at every call start; without it the
- * uplink of a modem call stayed silent on SM7150 (CVD 2.3) while the
- * downlink played.
- */
-int q6voice_common_set_mute(struct q6voice_session *s, bool tx, bool mute)
-{
-	struct vss_ivolume_cmd_mute_v2_cmd cmd = { };
-
-	cmd.hdr.pkt_size = sizeof(cmd);
-	cmd.hdr.opcode = VSS_IVOLUME_CMD_MUTE_V2;
-	cmd.direction = tx ? VSS_IVOLUME_DIRECTION_TX : VSS_IVOLUME_DIRECTION_RX;
-	cmd.mute_flag = mute;
-
-	return q6voice_common_send(s, &cmd.hdr);
-}
-EXPORT_SYMBOL_GPL(q6voice_common_set_mute);
-
 MODULE_AUTHOR("Stephan Gerhold <stephan@gerhold.net>");
 MODULE_DESCRIPTION("Q6Voice common session management");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");

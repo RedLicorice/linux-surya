@@ -4,17 +4,33 @@
 
 #include "q6voice.h"
 
+/* Stock voice topologies; the vendor takes these from calibration instead. */
+#define VSS_IVOCPROC_TOPOLOGY_ID_NONE			0x00010F70
+#define VSS_IVOCPROC_TOPOLOGY_ID_TX_SM_ECNS		0x00010F71
+#define VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT		0x00010F77
+
 struct q6voice_session;
 
 struct q6voice_session *q6cvp_session_create(enum q6voice_path_type path,
 					     u16 tx_port, u16 rx_port,
-					     u32 tx_topo, u32 rx_topo);
-struct q6voice_session *q6cvp_session_create_v3(enum q6voice_path_type path,
-						u16 tx_port, u16 rx_port,
-						u32 tx_topo, u32 rx_topo);
-int q6cvp_send_channel_info(struct q6voice_session *cvp, bool is_tx);
-int q6cvp_send_media_format(struct q6voice_session *cvp, int port_id, bool is_tx);
+					     bool create_v3);
+void q6cvp_get_topologies(u32 *tx_topology_id, u32 *rx_topology_id);
+int q6cvp_set_channel_info(struct q6voice_session *cvp);
+int q6cvp_set_media_format(struct q6voice_session *cvp, u16 tx_port, u16 rx_port);
 int q6cvp_topology_commit(struct q6voice_session *cvp);
+int q6cvp_set_rx_volume(struct q6voice_session *cvp, u32 step, u16 ramp_ms);
+int q6cvp_set_device_mute(struct q6voice_session *cvp, u16 direction, bool mute,
+			  u16 ramp_ms);
+int q6cvp_register_vol_cal(struct q6voice_session *cvp, bool instance,
+			   u32 mem_handle, phys_addr_t phys, u32 size,
+			   const void *col_info, u32 col_size);
+int q6cvp_register_cal(struct q6voice_session *cvp, bool instance,
+		       u32 mem_handle, phys_addr_t phys, u32 size,
+		       const void *col_info, u32 col_size);
+int q6cvp_register_dev_cfg(struct q6voice_session *cvp, u32 mem_handle,
+			   phys_addr_t phys, u32 size);
+int q6cvp_set_mfc_config(struct q6voice_session *cvp);
+int q6cvp_deregister_vol_cal(struct q6voice_session *cvp);
 int q6cvp_enable(struct q6voice_session *cvp, bool enable);
 
-#endif /* _Q6_CVP_H */
+#endif /*_Q6_CVP_H */

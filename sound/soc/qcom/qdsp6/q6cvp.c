@@ -4,9 +4,7 @@
 
 #include <linux/minmax.h>
 #include <linux/module.h>
-#include <linux/moduleparam.h>
 #include <linux/of.h>
-#include <linux/string.h>
 #include <linux/soc/qcom/apr.h>
 #include "q6cvp.h"
 #include "q6voice-common.h"
@@ -17,11 +15,9 @@
 
 #define VSS_IVOCPROC_PORT_ID_NONE	0xFFFF
 
-#define VSS_IVOCPROC_TOPOLOGY_ID_NONE			0x00010F70
-#define VSS_IVOCPROC_TOPOLOGY_ID_TX_SM_ECNS		0x00010F71
 #define VSS_IVOCPROC_TOPOLOGY_ID_TX_DM_FLUENCE		0x00010F72
+#define VSS_IVOCPROC_TOPOLOGY_ID_TX_SM_ECNS_V2		0x00010F89
 
-#define VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT		0x00010F77
 
 #define VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING		0x00010F7C
 #define VSS_IVOCPROC_VOCPROC_MODE_EC_EXT_MIXING		0x00010F7D
@@ -30,24 +26,233 @@
 
 #define VSS_IVOCPROC_CMD_ENABLE				0x000100C6
 #define VSS_IVOCPROC_CMD_DISABLE			0x000110E1
+#define VSS_ICOMMON_CMD_SET_PARAM_V2			0x0001133D
+#define VSS_MODULE_CVD_GENERIC				0x0001316E
+#define VSS_PARAM_VOCPROC_TX_CHANNEL_INFO		0x0001328E
+#define VSS_PARAM_VOCPROC_RX_CHANNEL_INFO		0x0001328F
+#define VSS_PARAM_VOCPROC_EC_REF_CHANNEL_INFO		0x00013290
+#define VSS_NUM_CHANNELS_MAX				32
+#define PCM_CHANNEL_FL					1
+#define PCM_CHANNEL_FR					2
+#define PCM_CHANNEL_FC					3
+
+/*
+ * Describe how many channels each side of the vocproc carries. The ADSP will
+ * not accept VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT until both directions have been
+ * described, and without the commit the vocproc is created but never runs.
+ * Narrowband call audio is mono 16-bit, mapped to front centre.
+ */
+struct vss_param_vocproc_dev_channel_info {
+	u32 num_channels;
+	u32 bits_per_sample;
+	u8 channel_mapping[VSS_NUM_CHANNELS_MAX];
+} __packed;
+
+struct vss_icommon_param_data_channel_info {
+	u32 module_id;
+	u32 param_id;
+	u16 param_size;
+	u16 reserved;
+	struct vss_param_vocproc_dev_channel_info channel_info;
+} __packed;
+
+struct vss_icommon_cmd_set_param_channel_info {
+	struct apr_hdr hdr;
+	/* zero: the payload is in-band, immediately below */
+	u32 mem_handle;
+	u64 mem_address;
+	u32 mem_size;
+	struct vss_icommon_param_data_channel_info param_data;
+} __packed;
+
+/*
+ * The vocproc renders in mono whatever the device is, so a stereo render port
+ * needs something in between to fan it out. That is the media format
+ * converter: one command sets up its channel mixer -- one channel in, as many
+ * out as the port carries, at unity gain -- and a second tells it what the
+ * port it is feeding actually looks like. The vendor sends both after
+ * committing the topology, and only when the port has more than one channel.
+ *
+ * Without them a stereo port gets a mono graph with nowhere to put its output.
+ */
+#define AUDPROC_MODULE_ID_MFC				0x00010912
+#define AUDPROC_CHMIXER_PARAM_ID_COEFF			0x00010342
+#define AUDPROC_PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT	0x00010913
+
+/* Unity in the Q14 fixed point the mixer weights use. */
+#define GAIN_Q14_UNITY					(1 << 14)
+
+#define PCM_CHANNEL_L					1
+#define PCM_CHANNEL_R					2
+
+struct vss_param_channel_mixer_info {
+	u32 index;
+	u16 num_output_channels;
+	u16 num_input_channels;
+	u16 out_channel_map[2];
+	u16 in_channel_map[1];
+	u16 channel_weight_coeff[2][1];
+	u16 reserved;
+} __packed;
+
+struct vss_icommon_param_data_ch_mixer {
+	u32 module_id;
+	u32 param_id;
+	u16 param_size;
+	u16 reserved;
+	struct vss_param_channel_mixer_info ch_mixer_info;
+} __packed;
+
+struct vss_icommon_cmd_set_param_ch_mixer {
+	struct apr_hdr hdr;
+	/* zero: the payload is in-band, immediately below */
+	u32 mem_handle;
+	u64 mem_address;
+	u32 mem_size;
+	struct vss_icommon_param_data_ch_mixer param_data;
+} __packed;
+
+struct vss_param_mfc_config_info {
+	u32 sample_rate;
+	u16 bits_per_sample;
+	u16 num_channels;
+	u16 channel_type[VSS_NUM_CHANNELS_MAX];
+} __packed;
+
+struct vss_icommon_param_data_mfc_config {
+	u32 module_id;
+	u32 param_id;
+	u16 param_size;
+	u16 reserved;
+	struct vss_param_mfc_config_info mfc_config_info;
+} __packed;
+
+struct vss_icommon_cmd_set_param_mfc_config {
+	struct apr_hdr hdr;
+	/* zero: the payload is in-band, immediately below */
+	u32 mem_handle;
+	u64 mem_address;
+	u32 mem_size;
+	struct vss_icommon_param_data_mfc_config param_data;
+} __packed;
+
+#define VSS_ICOMMON_CMD_SET_PARAM_V3			0x00013245
+#define VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO		0x00013253
+#define VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO		0x00013254
+#define VSS_PARAM_EC_REF_PORT_ENDPOINT_MEDIA_INFO	0x00013255
+
+/*
+ * Media format for each endpoint. Unlike the channel info above this goes
+ * through the newer parameter path: the ADSP reports instance-ID support, so
+ * the header is a v3 and the command is SET_PARAM_V3. Narrowband call audio is
+ * mono 16-bit at 8 kHz.
+ */
+struct param_hdr_v3 {
+	u32 module_id;
+	u16 instance_id;
+	u16 reserved;
+	u32 param_id;
+	u32 param_size;
+} __packed;
+
+struct vss_param_endpoint_media_format_info {
+	u32 port_id;
+	u16 num_channels;
+	u16 bits_per_sample;
+	u32 sample_rate;
+	u8 channel_mapping[VSS_NUM_CHANNELS_MAX];
+} __packed;
+
+struct vss_icommon_cmd_set_param_media_format {
+	struct apr_hdr hdr;
+	/* zero: the payload is in-band, immediately below */
+	u32 mem_handle;
+	u64 mem_address;
+	u32 payload_size;
+	struct param_hdr_v3 param_hdr;
+	struct vss_param_endpoint_media_format_info media_format;
+} __packed;
+
+#define VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT		0x00013198
 
 #define VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2	0x000112BF
 #define VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V3	0x00013169
 
-#define VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT		0x00013198
+#define VSS_IVOLUME_CMD_SET_STEP			0x000112C2
+#define VSS_IVOLUME_CMD_MUTE_V2				0x0001138B
 
-#define VSS_ICOMMON_CMD_SET_PARAM_V2			0x0001133D
+#define VSS_IVOLUME_MUTE_OFF				0
+#define VSS_IVOLUME_MUTE_ON				1
 
-#define VSS_MODULE_CVD_GENERIC				0x0001316E
+struct vss_ivolume_cmd_mute_v2 {
+	struct apr_hdr hdr;
 
-#define VSS_PARAM_VOCPROC_RX_CHANNEL_INFO		0x0001328F
-#define VSS_PARAM_VOCPROC_TX_CHANNEL_INFO		0x0001328E
-#define VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO		0x00013254
-#define VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO		0x00013253
+	u16 direction;
+	u16 mute_flag;
+	u16 ramp_duration_ms;
+} __packed;
 
-#define VOC_SET_MEDIA_FORMAT_PARAM_TOKEN		2
+#define VSS_IVOCPROC_CMD_REGISTER_VOL_CALIBRATION_DATA	0x00011374
+#define VSS_IVOCPROC_CMD_DEREGISTER_VOL_CALIBRATION_DATA	0x00011375
 
-#define VSS_NUM_CHANNELS_MAX 8
+#define VSS_IVOCPROC_CMD_REGISTER_DEVICE_CONFIG		0x00011371
+#define VSS_IVOCPROC_CMD_REGISTER_CALIBRATION_DATA_V2	0x00011373
+
+/*
+ * Calibration comes in two eras. The older commands take a table whose rows
+ * are keyed by device and volume step; the newer ones take a table that also
+ * carries a module instance per parameter, and the two are not
+ * interchangeable -- handing an instance table to the command that expects the
+ * older one is rejected as a bad parameter, which reads as bad calibration
+ * data when the data is fine. Which applies goes with the vocproc's own
+ * version, so it is decided the same way the create command is.
+ */
+#define VSS_IVOCPROC_CMD_REGISTER_STATIC_CALIBRATION_DATA	0x00013079
+#define VSS_IVOCPROC_CMD_REGISTER_DYNAMIC_CALIBRATION_DATA	0x0001307B
+
+/* No column description: the device configuration is not an indexed table. */
+struct vss_ivocproc_cmd_register_device_config {
+	struct apr_hdr hdr;
+
+	u32 mem_handle;
+	u32 mem_address_lsw;
+	u32 mem_address_msw;
+	u32 mem_size;
+} __packed;
+
+/*
+ * Largest column description the ADSP accepts. The columns say how the
+ * calibration table is indexed -- which is what lets the ADSP turn a volume
+ * step into a row -- so this travels with the data rather than in it.
+ */
+#define VSS_MAX_COL_INFO_SIZE				324
+
+struct vss_ivocproc_cmd_register_vol_cal_data {
+	struct apr_hdr hdr;
+
+	u32 cal_mem_handle;
+	u32 cal_mem_address_lsw;
+	u32 cal_mem_address_msw;
+	u32 cal_mem_size;
+	u8 column_info[VSS_MAX_COL_INFO_SIZE];
+} __packed;
+
+struct vss_ivocproc_cmd_deregister_vol_cal_data {
+	struct apr_hdr hdr;
+} __packed;
+
+struct vss_ivolume_cmd_set_step {
+	struct apr_hdr hdr;
+
+	/* Only VSS_IVOLUME_DIRECTION_RX is supported. */
+	u16 direction;
+
+	/* Index into the volume calibration table, not a linear gain. */
+	u32 value;
+
+	/* Ramp duration in ms; the supported range is 0 to 5000. */
+	u16 ramp_duration_ms;
+} __packed;
 
 struct vss_ivocproc_cmd_create_full_control_session_v2_cmd {
 	struct apr_hdr hdr;
@@ -110,222 +315,361 @@ struct vss_ivocproc_cmd_create_full_control_session_v2_cmd {
 	char name[20];
 } __packed;
 
-struct vss_param_endpoint_media_format_info {
-	u32 port_id;
-	u16 num_channels;
-	u16 bits_per_sample;
-	u32 sample_rate;
-	u8 channel_mapping[VSS_NUM_CHANNELS_MAX];
-} __packed;
+/*
+ * The render port to reference for echo cancellation, or zero to let the
+ * vocproc reference its own render path. Only meaningful with a topology that
+ * contains an echo canceller.
+ */
+static unsigned int ec_ref_port;
+module_param(ec_ref_port, uint, 0644);
+MODULE_PARM_DESC(ec_ref_port,
+		 "AFE port to use as the echo reference (0 = internal mixing).");
 
-struct vss_param_vocproc_dev_channel_info {
-	u32 num_channels;
-	u32 bits_per_sample;
-	u8 channel_mapping[VSS_NUM_CHANNELS_MAX];
-} __packed;
-
-struct vss_icommon_param_data {
-	u32 module_id;
-	u32 param_id;
-	u16 param_size;
-	u16 reserved;
-
-	union {
-		struct vss_param_endpoint_media_format_info media_format_info;
-		struct vss_param_vocproc_dev_channel_info channel_info;
-	};
-} __packed;
-
-struct vss_icommon_cmd_set_param_v2_cmd {
-	struct apr_hdr hdr;
-
-	/*
-	 * Pointer to the unique identifier for an address. What type of
-	 * address? DMA? Device-specific memory? Please direct inquiries of
-	 * this type to the SoC manufacturer.
-	 *
-	 * Anyway, the most important information for this parameter is that
-	 * this field is set to zero if the data is in-band, i.e. in the same
-	 * packet.
-	 */
-	u32 mem_handle;
-
-	/*
-	 * This field is ignored if you are only paying attention to this
-	 * documentation of the fields. Otherwise, refer to your own
-	 * documentation. I did not ask for this, and will not fully document
-	 * it if its accuracy cannot be measured.
-	 */
-	u64 mem_address;
-
-	/*
-	 * Just set this to the size of the parameter data.
-	 */
-	u32 mem_size;
-
-	struct vss_icommon_param_data param_data;
-} __packed;
+static bool bypass_topology = true;
+module_param(bypass_topology, bool, 0644);
+MODULE_PARM_DESC(bypass_topology,
+		 "Create the vocproc with no processing topology (default), rather than the echo-cancelling one, which needs calibration this driver cannot supply yet.");
 
 /*
- * Endpoint format the vocproc is told about with CVD 2.3 and newer. It has to
- * match what the AFE ports were configured with by the backend dai-links: the
- * sm8250 machine driver fixes every backend at 48 kHz, 2 channels, S16_LE.
- * Writable so a different combination can be tried between two calls without
- * rebuilding (the values are read when a call starts).
+ * OEM CVD firmware can provide different processing topology IDs from the
+ * generic SM-ECNS / RX-default pair.  Keep the generic defaults for
+ * existing boards, but let a board-specific boot service supply the IDs
+ * captured from its stock voice stack before the first call.
  */
-static unsigned int rx_channels = 2;
-module_param(rx_channels, uint, 0644);
-MODULE_PARM_DESC(rx_channels, "RX (earpiece/speaker) endpoint channels, 1..8 (default 2)");
+static unsigned int tx_topology = VSS_IVOCPROC_TOPOLOGY_ID_TX_SM_ECNS;
+module_param(tx_topology, uint, 0644);
+MODULE_PARM_DESC(tx_topology,
+		 "CVP transmit processing topology when bypass_topology is disabled.");
 
-static unsigned int tx_channels = 1;
-module_param(tx_channels, uint, 0644);
-MODULE_PARM_DESC(tx_channels, "TX (microphone) endpoint channels, 1..8 (default 1)");
+static unsigned int rx_topology = VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT;
+module_param(rx_topology, uint, 0644);
+MODULE_PARM_DESC(rx_topology,
+		 "CVP receive processing topology when bypass_topology is disabled.");
 
-static unsigned int sample_rate = 48000;
-module_param(sample_rate, uint, 0644);
-MODULE_PARM_DESC(sample_rate, "RX/TX endpoint sample rate in Hz (default 48000)");
-
-#define PCM_CHANNEL_FL	1
-#define PCM_CHANNEL_FR	2
-#define PCM_CHANNEL_FC	3
-
-static unsigned int q6cvp_channels(bool is_tx)
+void q6cvp_get_topologies(u32 *tx_topology_id, u32 *rx_topology_id)
 {
-	unsigned int ch = is_tx ? tx_channels : rx_channels;
-
-	return clamp(ch, 1U, (unsigned int)VSS_NUM_CHANNELS_MAX);
-}
-
-/*
- * Position of a mono endpoint. Downstream says FC, but the machine driver runs
- * every backend as FL/FR, and the vocproc then finds no FC channel in the
- * port: the uplink stayed silent. The original SDM670 code said FL.
- */
-static unsigned int mono_channel = PCM_CHANNEL_FL;
-module_param(mono_channel, uint, 0644);
-MODULE_PARM_DESC(mono_channel, "PCM channel position of a mono endpoint: 1 = FL (default), 3 = FC");
-
-static void q6cvp_channel_map(u8 *map, unsigned int ch)
-{
-	unsigned int i;
-
-	memset(map, 0, VSS_NUM_CHANNELS_MAX);
-
-	if (ch == 1) {
-		map[0] = mono_channel;
-		return;
+	if (bypass_topology) {
+		*tx_topology_id = VSS_IVOCPROC_TOPOLOGY_ID_NONE;
+		*rx_topology_id = VSS_IVOCPROC_TOPOLOGY_ID_NONE;
+	} else {
+		*tx_topology_id = tx_topology;
+		*rx_topology_id = rx_topology;
 	}
-
-	for (i = 0; i < ch; i++)
-		map[i] = PCM_CHANNEL_FL + i;
 }
+EXPORT_SYMBOL_GPL(q6cvp_get_topologies);
 
-static struct q6voice_session *
-q6cvp_create_full_control(u32 opcode, enum q6voice_path_type path,
-			  u16 tx_port, u16 rx_port, u32 tx_topo, u32 rx_topo)
+struct q6voice_session *q6cvp_session_create(enum q6voice_path_type path,
+					     u16 tx_port, u16 rx_port,
+					     bool create_v3)
 {
-	struct vss_ivocproc_cmd_create_full_control_session_v2_cmd cmd = { };
+	/*
+	 * Zeroed rather than field-by-field: the trailing name is optional and
+	 * the vendor leaves it empty, but it still goes out on the wire, so it
+	 * must not be whatever was on the stack.
+	 */
+	struct vss_ivocproc_cmd_create_full_control_session_v2_cmd cmd = {0};
 
 	cmd.hdr.pkt_size = sizeof(cmd);
-	cmd.hdr.opcode = opcode;
+	/* Same payload either way -- see q6voice_cvp_create_v3(). */
+	cmd.hdr.opcode = create_v3 ?
+		VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V3 :
+		VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2;
 
-	cmd.tx_topology_id = tx_topo;
-	cmd.rx_topology_id = rx_topo;
+	/*
+	 * The processing topologies are chains of modules -- echo cancellation,
+	 * noise suppression -- that expect their parameters to come from
+	 * calibration we do not have. Asking for them without it gets a vocproc
+	 * that is created, enabled, and produces nothing. NONE is the
+	 * pass-through: no modules, no parameters, just the audio.
+	 */
+	q6cvp_get_topologies(&cmd.tx_topology_id, &cmd.rx_topology_id);
 
 	cmd.direction = VSS_IVOCPROC_DIRECTION_RX_TX;
 	cmd.tx_port_id = tx_port;
 	cmd.rx_port_id = rx_port;
 	cmd.profile_id = VSS_ICOMMON_CAL_NETWORK_ID_NONE;
-	cmd.vocproc_mode = VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING;
-	cmd.ec_ref_port_id = VSS_IVOCPROC_PORT_ID_NONE;
+	/*
+	 * Where the echo canceller gets its reference.
+	 *
+	 * Internal mixing leaves the vocproc to reference its own render path
+	 * and needs no port. The vendor does not use it here: it adds one echo
+	 * reference for this board, the tertiary render port, and hands it over
+	 * explicitly -- which is external mixing. A topology built for that and
+	 * run with internal mixing is what put the far end back in its own ear.
+	 */
+	if (ec_ref_port) {
+		cmd.vocproc_mode = VSS_IVOCPROC_VOCPROC_MODE_EC_EXT_MIXING;
+		cmd.ec_ref_port_id = ec_ref_port;
+	} else {
+		cmd.vocproc_mode = VSS_IVOCPROC_VOCPROC_MODE_EC_INT_MIXING;
+		cmd.ec_ref_port_id = VSS_IVOCPROC_PORT_ID_NONE;
+	}
+
+	pr_info("q6cvp: create%s tx_port %#06x rx_port %#06x tx_topo %#010x rx_topo %#010x direction %u mode %#010x ec_ref %#06x profile %#010x\n",
+		create_v3 ? " v3" : " v2", cmd.tx_port_id, cmd.rx_port_id,
+		cmd.tx_topology_id, cmd.rx_topology_id, cmd.direction,
+		cmd.vocproc_mode, cmd.ec_ref_port_id, cmd.profile_id);
 
 	return q6voice_session_create(Q6VOICE_SERVICE_CVP, path, &cmd.hdr);
 }
-
-struct q6voice_session *q6cvp_session_create(enum q6voice_path_type path,
-					     u16 tx_port, u16 rx_port,
-					     u32 tx_topo, u32 rx_topo)
-{
-	return q6cvp_create_full_control(VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2,
-					 path, tx_port, rx_port, tx_topo, rx_topo);
-}
 EXPORT_SYMBOL_GPL(q6cvp_session_create);
 
-struct q6voice_session *q6cvp_session_create_v3(enum q6voice_path_type path,
-						u16 tx_port, u16 rx_port,
-						u32 tx_topo, u32 rx_topo)
+/*
+ * What the ports on either side of the vocproc are actually running at. The
+ * DSP is told this so it can match its endpoints to them; describing a port
+ * that runs at 48 kHz stereo as 8 kHz mono gets a vocproc that is created,
+ * enabled and silent. The machine driver pins every backend to 48 kHz S16 and
+ * varies only the channel count, so these are the defaults; they are writable
+ * for boards that route voice somewhere else.
+ */
+static unsigned int rx_rate = 96000;
+module_param(rx_rate, uint, 0644);
+MODULE_PARM_DESC(rx_rate, "Sample rate of the vocproc's render port.");
+
+static unsigned int tx_rate = 48000;
+module_param(tx_rate, uint, 0644);
+MODULE_PARM_DESC(tx_rate, "Sample rate of the vocproc's capture port.");
+
+static unsigned int rx_channels = 2;
+module_param(rx_channels, uint, 0644);
+MODULE_PARM_DESC(rx_channels, "Channel count of the vocproc's render port.");
+
+/*
+ * One channel, because the vocproc has no topology.
+ *
+ * The stock system runs this port with two -- the top mic carries speech and
+ * the bottom one is an echo reference -- but that only makes sense with a
+ * dual-mic processing topology to combine them, and this ADSP will not commit
+ * one: its own 0x1000FFFC needs a custom-topology blob it rejects as
+ * EBADPARAM, and the generic TX_DM_FLUENCE fails TOPOLOGY_COMMIT outright with
+ * EFAILED. With VSS_IVOCPROC_TOPOLOGY_ID_NONE there is no block to merge two
+ * microphones into the single stream the vocoder encodes, and asking for two
+ * leaves the uplink silent.
+ *
+ * The backend still runs both mics; taking one channel takes the first, which
+ * is DEC0 -- AMIC5, the top mic, the speech one. Uplink is therefore
+ * unprocessed: no echo cancellation or noise suppression until the custom
+ * topology can be registered.
+ */
+static unsigned int tx_channels = 1;
+module_param(tx_channels, uint, 0644);
+MODULE_PARM_DESC(tx_channels, "Channel count of the vocproc's capture port.");
+
+static unsigned int rx_bits = 24;
+module_param(rx_bits, uint, 0644);
+MODULE_PARM_DESC(rx_bits, "Sample width of the vocproc's render port.");
+
+static unsigned int tx_bits = 16;
+module_param(tx_bits, uint, 0644);
+MODULE_PARM_DESC(tx_bits, "Sample width of the vocproc's capture port.");
+
+static unsigned int q6cvp_map_channels(u8 *mapping, unsigned int channels)
 {
+	channels = clamp_val(channels, 1, VSS_NUM_CHANNELS_MAX);
+
+	if (channels == 1) {
+		mapping[0] = PCM_CHANNEL_FC;
+	} else {
+		mapping[0] = PCM_CHANNEL_FL;
+		mapping[1] = PCM_CHANNEL_FR;
+	}
+
+	return channels;
+}
+
+static int q6cvp_set_channel_info_one(struct q6voice_session *cvp, u32 param_id,
+				      unsigned int channels, unsigned int bits)
+{
+	struct vss_icommon_cmd_set_param_channel_info cmd = {0};
+
+	cmd.hdr.pkt_size = sizeof(cmd);
+	cmd.hdr.opcode = VSS_ICOMMON_CMD_SET_PARAM_V2;
+
+	cmd.mem_size = sizeof(cmd.param_data);
+
+	cmd.param_data.module_id = VSS_MODULE_CVD_GENERIC;
+	cmd.param_data.param_id = param_id;
+	cmd.param_data.param_size = sizeof(cmd.param_data.channel_info);
+
+	cmd.param_data.channel_info.num_channels =
+		q6cvp_map_channels(cmd.param_data.channel_info.channel_mapping,
+				   channels);
+	cmd.param_data.channel_info.bits_per_sample = bits;
+
+	return q6voice_common_send(cvp, &cmd.hdr);
+}
+
+int q6cvp_set_channel_info(struct q6voice_session *cvp)
+{
+	int ret;
+
+	ret = q6cvp_set_channel_info_one(cvp, VSS_PARAM_VOCPROC_RX_CHANNEL_INFO,
+					 rx_channels, rx_bits);
+	if (ret)
+		return ret;
+
+	ret = q6cvp_set_channel_info_one(cvp, VSS_PARAM_VOCPROC_TX_CHANNEL_INFO,
+					 tx_channels, tx_bits);
+	if (ret)
+		return ret;
+
 	/*
-	 * According to downstream, the v3 parameters are the exact same, with
-	 * the only difference being the opcode.
+	 * The echo reference is described whether or not one is in use, and it
+	 * describes the render side: it is the render output that would be
+	 * referenced. The vendor sends all three unconditionally.
 	 */
-	return q6cvp_create_full_control(VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V3,
-					 path, tx_port, rx_port, tx_topo, rx_topo);
+	return q6cvp_set_channel_info_one(cvp,
+					  VSS_PARAM_VOCPROC_EC_REF_CHANNEL_INFO,
+					  rx_channels, rx_bits);
 }
-EXPORT_SYMBOL_GPL(q6cvp_session_create_v3);
+EXPORT_SYMBOL_GPL(q6cvp_set_channel_info);
 
-int q6cvp_send_channel_info(struct q6voice_session *cvp, bool is_tx)
+static int q6cvp_set_media_format_one(struct q6voice_session *cvp, u32 param_id,
+				      u16 port_id, unsigned int rate,
+				      unsigned int channels, unsigned int bits)
 {
-	struct vss_icommon_cmd_set_param_v2_cmd cmd = { };
-	unsigned int ch = q6cvp_channels(is_tx);
+	struct vss_icommon_cmd_set_param_media_format cmd = {0};
 
-	cmd.hdr.pkt_size = offsetof(struct vss_icommon_cmd_set_param_v2_cmd,
-				    param_data.channel_info)
-			 + sizeof(struct vss_param_vocproc_dev_channel_info);
-	cmd.hdr.opcode = VSS_ICOMMON_CMD_SET_PARAM_V2;
+	cmd.hdr.pkt_size = sizeof(cmd);
+	cmd.hdr.opcode = VSS_ICOMMON_CMD_SET_PARAM_V3;
 
-	/* in-band parameter data: no memory handle, no address */
-	cmd.mem_handle = 0;
-	cmd.mem_address = 0;
-	cmd.mem_size = offsetof(struct vss_icommon_param_data, channel_info)
-		     + sizeof(struct vss_param_vocproc_dev_channel_info);
+	cmd.payload_size = sizeof(cmd.param_hdr) + sizeof(cmd.media_format);
 
-	cmd.param_data.module_id = VSS_MODULE_CVD_GENERIC;
-	cmd.param_data.param_id = is_tx ? VSS_PARAM_VOCPROC_TX_CHANNEL_INFO
-					: VSS_PARAM_VOCPROC_RX_CHANNEL_INFO;
-	cmd.param_data.param_size = sizeof(struct vss_param_vocproc_dev_channel_info);
+	cmd.param_hdr.module_id = VSS_MODULE_CVD_GENERIC;
+	cmd.param_hdr.param_id = param_id;
+	cmd.param_hdr.param_size = sizeof(cmd.media_format);
 
-	cmd.param_data.channel_info.num_channels = ch;
-	cmd.param_data.channel_info.bits_per_sample = 16;
-	q6cvp_channel_map(cmd.param_data.channel_info.channel_mapping, ch);
+	cmd.media_format.port_id = port_id;
+	cmd.media_format.num_channels =
+		q6cvp_map_channels(cmd.media_format.channel_mapping, channels);
+	cmd.media_format.bits_per_sample = bits;
+	cmd.media_format.sample_rate = rate;
+
+	pr_info("q6cvp: %s endpoint port %#06x rate %u channels %u bits %u mapping %u,%u\n",
+		param_id == VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO ? "rx" :
+		param_id == VSS_PARAM_EC_REF_PORT_ENDPOINT_MEDIA_INFO ? "ec_ref" : "tx",
+		port_id, cmd.media_format.sample_rate,
+		cmd.media_format.num_channels, cmd.media_format.bits_per_sample,
+		cmd.media_format.channel_mapping[0],
+		cmd.media_format.channel_mapping[1]);
 
 	return q6voice_common_send(cvp, &cmd.hdr);
 }
-EXPORT_SYMBOL_GPL(q6cvp_send_channel_info);
 
-int q6cvp_send_media_format(struct q6voice_session *cvp, int port_id, bool is_tx)
+int q6cvp_set_media_format(struct q6voice_session *cvp, u16 tx_port, u16 rx_port)
 {
-	struct vss_icommon_cmd_set_param_v2_cmd cmd = { };
-	unsigned int ch = q6cvp_channels(is_tx);
+	int ret;
 
-	cmd.hdr.pkt_size = offsetof(struct vss_icommon_cmd_set_param_v2_cmd,
-				    param_data.media_format_info)
-			 + sizeof(struct vss_param_endpoint_media_format_info);
-	cmd.hdr.opcode = VSS_ICOMMON_CMD_SET_PARAM_V2;
+	ret = q6cvp_set_media_format_one(cvp,
+					 VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO,
+					 rx_port, rx_rate, rx_channels, rx_bits);
+	if (ret)
+		return ret;
 
-	cmd.mem_handle = 0;
-	cmd.mem_address = 0;
-	cmd.mem_size = offsetof(struct vss_icommon_param_data, media_format_info)
-		     + sizeof(struct vss_param_endpoint_media_format_info);
+	ret = q6cvp_set_media_format_one(cvp,
+					 VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO,
+					 tx_port, tx_rate, tx_channels, tx_bits);
+	if (ret)
+		return ret;
 
-	cmd.param_data.module_id = VSS_MODULE_CVD_GENERIC;
-	cmd.param_data.param_id = is_tx ? VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO
-					: VSS_PARAM_RX_PORT_ENDPOINT_MEDIA_INFO;
-	cmd.param_data.param_size = sizeof(struct vss_param_endpoint_media_format_info);
+	/*
+	 * Describe the echo-reference endpoint too, or the vocproc has no
+	 * idea what format flows on the port it was told to take its
+	 * reference from. The vendor sends this whenever an external EC
+	 * reference is configured (common.ec_ref_ext); a missing
+	 * description leaves the wideband TX chain waiting on a reference
+	 * it cannot interpret - observed here as the 16 kHz input tap of
+	 * topology 0x1000fffc reading exactly zero. The reference carries
+	 * the render port's format.
+	 */
+	if (!ec_ref_port)
+		return 0;
 
-	cmd.param_data.media_format_info.port_id = port_id;
-	cmd.param_data.media_format_info.num_channels = ch;
-	cmd.param_data.media_format_info.bits_per_sample = 16;
-	cmd.param_data.media_format_info.sample_rate = sample_rate;
-	q6cvp_channel_map(cmd.param_data.media_format_info.channel_mapping, ch);
-
-	return q6voice_common_send(cvp, &cmd.hdr);
+	return q6cvp_set_media_format_one(cvp,
+					  VSS_PARAM_EC_REF_PORT_ENDPOINT_MEDIA_INFO,
+					  ec_ref_port, rx_rate, rx_channels,
+					  rx_bits);
 }
-EXPORT_SYMBOL_GPL(q6cvp_send_media_format);
+EXPORT_SYMBOL_GPL(q6cvp_set_media_format);
 
+/*
+ * Off by default. The vendor's own driver decides this on the render port's
+ * channel count and would send it here, but a capture of a working call on
+ * this board shows it does not -- nothing follows the topology commit. So the
+ * DSP evidently does not want it, whatever the source says, and a command the
+ * working case omits is not one to send speculatively.
+ */
+static bool mfc_config;
+module_param(mfc_config, bool, 0644);
+MODULE_PARM_DESC(mfc_config,
+		 "Set up the media format converter behind a multi-channel render port.");
+
+/*
+ * Fan the vocproc's mono render out to however many channels the port takes,
+ * and describe that port to the converter doing it. Only needed when the port
+ * is not mono; see the module ids above.
+ */
+int q6cvp_set_mfc_config(struct q6voice_session *cvp)
+{
+	struct vss_icommon_cmd_set_param_mfc_config mfc = {0};
+	struct vss_icommon_cmd_set_param_ch_mixer mix = {0};
+	unsigned int channels, i;
+	int ret;
+
+	channels = clamp_val(rx_channels, 1, VSS_NUM_CHANNELS_MAX);
+	if (!mfc_config || channels < 2)
+		return 0;
+
+	mix.hdr.pkt_size = sizeof(mix);
+	mix.hdr.opcode = VSS_ICOMMON_CMD_SET_PARAM_V2;
+	mix.mem_size = sizeof(mix.param_data);
+
+	mix.param_data.module_id = AUDPROC_MODULE_ID_MFC;
+	mix.param_data.param_id = AUDPROC_CHMIXER_PARAM_ID_COEFF;
+	mix.param_data.param_size = sizeof(mix.param_data.ch_mixer_info);
+
+	mix.param_data.ch_mixer_info.index = 0;
+	mix.param_data.ch_mixer_info.num_output_channels = channels;
+	mix.param_data.ch_mixer_info.num_input_channels = 1;
+	mix.param_data.ch_mixer_info.out_channel_map[0] = PCM_CHANNEL_L;
+	mix.param_data.ch_mixer_info.out_channel_map[1] = PCM_CHANNEL_R;
+	mix.param_data.ch_mixer_info.in_channel_map[0] = PCM_CHANNEL_L;
+	/* The one input channel goes to each output at unity. */
+	mix.param_data.ch_mixer_info.channel_weight_coeff[0][0] = GAIN_Q14_UNITY;
+	mix.param_data.ch_mixer_info.channel_weight_coeff[1][0] = GAIN_Q14_UNITY;
+
+	ret = q6voice_common_send(cvp, &mix.hdr);
+	if (ret)
+		return ret;
+
+	mfc.hdr.pkt_size = sizeof(mfc);
+	mfc.hdr.opcode = VSS_ICOMMON_CMD_SET_PARAM_V2;
+	mfc.mem_size = sizeof(mfc.param_data);
+
+	mfc.param_data.module_id = AUDPROC_MODULE_ID_MFC;
+	mfc.param_data.param_id = AUDPROC_PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT;
+	mfc.param_data.param_size = sizeof(mfc.param_data.mfc_config_info);
+
+	mfc.param_data.mfc_config_info.sample_rate = rx_rate;
+	mfc.param_data.mfc_config_info.bits_per_sample = 16;
+	mfc.param_data.mfc_config_info.num_channels = channels;
+	for (i = 0; i < channels; i++)
+		mfc.param_data.mfc_config_info.channel_type[i] = i + 1;
+
+	pr_info("q6cvp: mfc %u channels out of 1, rate %u\n", channels, rx_rate);
+
+	return q6voice_common_send(cvp, &mfc.hdr);
+}
+EXPORT_SYMBOL_GPL(q6cvp_set_mfc_config);
+
+/*
+ * Tell the vocproc its topology is fully described and may be brought up.
+ * The vendor treats this as mandatory between creating the vocproc and
+ * enabling it -- without it the session is accepted but stays inert.
+ */
 int q6cvp_topology_commit(struct q6voice_session *cvp)
 {
-	struct apr_pkt cmd = { };
+	struct apr_pkt cmd;
 
 	cmd.hdr.pkt_size = APR_HDR_SIZE;
 	cmd.hdr.opcode = VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT;
@@ -334,9 +678,145 @@ int q6cvp_topology_commit(struct q6voice_session *cvp)
 }
 EXPORT_SYMBOL_GPL(q6cvp_topology_commit);
 
+/*
+ * Ask the vocproc for an audible downlink.
+ *
+ * The step is an index into the ADSP's volume calibration table, not a gain:
+ * step 0 is the bottom of that table. Both the vendor kernel and this driver
+ * start every session there, and on Android the audio HAL immediately replaces
+ * it through a "Voice Rx Gain" mixer control. We have no such control, so
+ * nothing ever lifted the downlink off the floor.
+ */
+int q6cvp_set_rx_volume(struct q6voice_session *cvp, u32 step, u16 ramp_ms)
+{
+	struct vss_ivolume_cmd_set_step cmd = {0};
+
+	cmd.hdr.pkt_size = sizeof(cmd);
+	cmd.hdr.opcode = VSS_IVOLUME_CMD_SET_STEP;
+
+	cmd.direction = VSS_IVOLUME_DIRECTION_RX;
+	cmd.value = step;
+	cmd.ramp_duration_ms = ramp_ms;
+
+	return q6voice_common_send(cvp, &cmd.hdr);
+}
+EXPORT_SYMBOL_GPL(q6cvp_set_rx_volume);
+
+/*
+ * Mute state of the device, as opposed to the stream. The two are separate
+ * gates on the same audio and both have to be open, so the vendor clears this
+ * one on both directions at the start of every call rather than trusting
+ * whatever the ADSP came up in. A vocproc left muted here accepts the whole
+ * setup, runs, exchanges packets with the modem, and is silent both ways.
+ */
+int q6cvp_set_device_mute(struct q6voice_session *cvp, u16 direction, bool mute,
+			  u16 ramp_ms)
+{
+	struct vss_ivolume_cmd_mute_v2 cmd = {0};
+
+	cmd.hdr.pkt_size = sizeof(cmd);
+	cmd.hdr.opcode = VSS_IVOLUME_CMD_MUTE_V2;
+
+	cmd.direction = direction;
+	cmd.mute_flag = mute ? VSS_IVOLUME_MUTE_ON : VSS_IVOLUME_MUTE_OFF;
+	cmd.ramp_duration_ms = ramp_ms;
+
+	return q6voice_common_send(cvp, &cmd.hdr);
+}
+EXPORT_SYMBOL_GPL(q6cvp_set_device_mute);
+
+/*
+ * Point the vocproc at a volume calibration table already lent to the ADSP.
+ *
+ * Without this the ADSP has no table to look a volume step up in, and
+ * VSS_IVOLUME_CMD_SET_STEP fails -- which is what a call with everything else
+ * accepted and no audible downlink looks like from here.
+ */
+static int q6cvp_register_table(struct q6voice_session *cvp, u32 opcode,
+				u32 mem_handle, phys_addr_t phys, u32 size,
+				const void *col_info, u32 col_size)
+{
+	struct vss_ivocproc_cmd_register_vol_cal_data cmd = {0};
+
+	if (col_size > sizeof(cmd.column_info))
+		return -EINVAL;
+
+	cmd.hdr.pkt_size = sizeof(cmd);
+	cmd.hdr.opcode = opcode;
+
+	cmd.cal_mem_handle = mem_handle;
+	cmd.cal_mem_address_lsw = lower_32_bits(phys);
+	cmd.cal_mem_address_msw = upper_32_bits(phys);
+	cmd.cal_mem_size = size;
+	if (col_size)
+		memcpy(cmd.column_info, col_info, col_size);
+
+	return q6voice_common_send(cvp, &cmd.hdr);
+}
+
+/*
+ * The per-step table: what a volume step is resolved through. @instance says
+ * which era the vocproc belongs to -- see the opcodes above.
+ */
+int q6cvp_register_vol_cal(struct q6voice_session *cvp, bool instance,
+			   u32 mem_handle, phys_addr_t phys, u32 size,
+			   const void *col_info, u32 col_size)
+{
+	return q6cvp_register_table(cvp,
+		instance ? VSS_IVOCPROC_CMD_REGISTER_DYNAMIC_CALIBRATION_DATA :
+			   VSS_IVOCPROC_CMD_REGISTER_VOL_CALIBRATION_DATA,
+		mem_handle, phys, size, col_info, col_size);
+}
+EXPORT_SYMBOL_GPL(q6cvp_register_vol_cal);
+
+/* Everything about the vocproc that does not vary with the volume step. */
+int q6cvp_register_cal(struct q6voice_session *cvp, bool instance,
+		       u32 mem_handle, phys_addr_t phys, u32 size,
+		       const void *col_info, u32 col_size)
+{
+	return q6cvp_register_table(cvp,
+		instance ? VSS_IVOCPROC_CMD_REGISTER_STATIC_CALIBRATION_DATA :
+			   VSS_IVOCPROC_CMD_REGISTER_CALIBRATION_DATA_V2,
+		mem_handle, phys, size, col_info, col_size);
+}
+EXPORT_SYMBOL_GPL(q6cvp_register_cal);
+
+/*
+ * What the vocproc's endpoints are, as opposed to how they are processed. The
+ * vendor registers this before either calibration table, and it is the only
+ * one of the three with no column description: it is not an indexed table.
+ */
+int q6cvp_register_dev_cfg(struct q6voice_session *cvp, u32 mem_handle,
+			   phys_addr_t phys, u32 size)
+{
+	struct vss_ivocproc_cmd_register_device_config cmd = {0};
+
+	cmd.hdr.pkt_size = sizeof(cmd);
+	cmd.hdr.opcode = VSS_IVOCPROC_CMD_REGISTER_DEVICE_CONFIG;
+
+	cmd.mem_handle = mem_handle;
+	cmd.mem_address_lsw = lower_32_bits(phys);
+	cmd.mem_address_msw = upper_32_bits(phys);
+	cmd.mem_size = size;
+
+	return q6voice_common_send(cvp, &cmd.hdr);
+}
+EXPORT_SYMBOL_GPL(q6cvp_register_dev_cfg);
+
+int q6cvp_deregister_vol_cal(struct q6voice_session *cvp)
+{
+	struct vss_ivocproc_cmd_deregister_vol_cal_data cmd = {0};
+
+	cmd.hdr.pkt_size = sizeof(cmd);
+	cmd.hdr.opcode = VSS_IVOCPROC_CMD_DEREGISTER_VOL_CALIBRATION_DATA;
+
+	return q6voice_common_send(cvp, &cmd.hdr);
+}
+EXPORT_SYMBOL_GPL(q6cvp_deregister_vol_cal);
+
 int q6cvp_enable(struct q6voice_session *cvp, bool state)
 {
-	struct apr_pkt cmd = { };
+	struct apr_pkt cmd;
 
 	cmd.hdr.pkt_size = APR_HDR_SIZE;
 	cmd.hdr.opcode = state ? VSS_IVOCPROC_CMD_ENABLE : VSS_IVOCPROC_CMD_DISABLE;
@@ -370,4 +850,4 @@ module_apr_driver(qcom_q6cvp_driver);
 
 MODULE_AUTHOR("Stephan Gerhold <stephan@gerhold.net>");
 MODULE_DESCRIPTION("Q6 Core Voice Processor");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");

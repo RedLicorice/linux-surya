@@ -30,16 +30,105 @@ struct q6voice_session {
 	u32 result;
 };
 
+/*
+ * Port used for commands that address a service rather than a session, such as
+ * the mailbox memory configuration. The ADSP echoes it back as dest_port, which
+ * is how the callback tells them apart from per-session replies.
+ */
+#define Q6VOICE_SVC_PORT	0x0103
+
+/*
+ * Direction for the VSS_IVOLUME commands, shared by the vocproc (volume) and
+ * the stream (mute). Note these are the other way round from
+ * VSS_IVOCPROC_DIRECTION_*, where RX is 0.
+ */
+#define VSS_IVOLUME_DIRECTION_TX	0
+#define VSS_IVOLUME_DIRECTION_RX	1
+
+/*
+ * Name of the session we create. The sessions on this side are passive: the
+ * modem owns the call and creates the matching active session, and the ADSP
+ * pairs the two up by this string. Nothing validates it, so getting it wrong
+ * is silent -- every command succeeds against a session the modem never joins,
+ * and no audio ever flows.
+ *
+ * Targets from about MSM8998 onwards, this one included, run MultiMode voice,
+ * where the first subscription is VSID 0x11C05000. The older
+ * "default modem voice" only matches pre-MultiMode modems.
+ *
+ * The name for a MultiMode session is the VSID itself, written as eight
+ * uppercase hex digits -- not a descriptive word. Qualcomm names the older
+ * fixed sessions ("default modem voice", "default volte voice") but switches to
+ * VOICEMMODE1_VSID_STR "11C05000" for these, and the modem's voice agent refers
+ * to the same session as VSID 0x11C05000. A descriptive name here is accepted
+ * by the ADSP and creates a session of its own, which the modem then never
+ * finds: its own session is created under the VSID name, the ADSP holds two
+ * unrelated sessions, and because it only announces VSS_IMVM_EVT_APPS_START
+ * once both an apps-side and a modem-side client have joined *the same* one, it
+ * never announces anything. The modem waits, times out, tears the session down
+ * and tries again, while every command on our side reports success.
+ */
+static inline const char *q6voice_session_name(enum q6voice_path_type path)
+{
+	switch (path) {
+	case Q6VOICE_PATH_VOICE:
+		return "11C05000";
+	default:
+		return NULL;
+	}
+}
+
+/*
+ * Bridge to a modem that lives on another chip. Such a modem carries the call
+ * audio itself, over a link that must be held awake for the duration, so
+ * q6voice has to tell it when a call starts and ends. The bridge is a module of
+ * its own and is absent on boards with an internal modem, so it registers
+ * itself here rather than q6voice reaching for it.
+ */
+struct q6voice_modem_link {
+	int (*start)(void);
+	void (*end)(void);
+};
+
+void q6voice_set_modem_link(const struct q6voice_modem_link *link);
+
+/*
+ * Called each time a service becomes usable, including after an ADSP restart,
+ * from a context that may send to it.
+ */
+void q6voice_common_set_svc_notifier(void (*notify)(enum q6voice_service_type));
+
+/*
+ * Turn a DMA address into one the DSP can resolve: see the definition. Use it
+ * for every address that crosses to the DSP, including those inside tables the
+ * DSP reads for itself.
+ */
+u64 q6voice_dsp_address(struct device *dev, dma_addr_t addr);
+
 int q6voice_common_probe(struct apr_device *adev, enum q6voice_service_type type);
 void q6voice_common_remove(struct apr_device *adev);
 
 int q6voice_common_callback(struct apr_device *adev, const struct apr_resp_pkt *data);
 int q6voice_common_send(struct q6voice_session *s, struct apr_hdr *hdr);
-int q6voice_common_set_mute(struct q6voice_session *s, bool tx, bool mute);
+int q6voice_common_send_svc(enum q6voice_service_type type, struct apr_hdr *hdr,
+			    u32 size);
+/*
+ * As above, but for commands answered with a payload of their own rather than
+ * a basic result. @rsp_opcode is the reply to wait for; up to @rsp_size bytes
+ * of its payload are copied into @rsp.
+ */
+int q6voice_common_send_svc_rsp(enum q6voice_service_type type,
+				struct apr_hdr *hdr, u32 size, u32 rsp_opcode,
+				void *rsp, u32 rsp_size);
+/* As above, addressed to a session rather than to the service itself. */
+int q6voice_common_send_svc_rsp_port(enum q6voice_service_type type,
+				     struct apr_hdr *hdr, u32 size,
+				     u16 dest_port, u32 rsp_opcode, void *rsp,
+				     u32 rsp_size);
 
 struct q6voice_session *q6voice_session_create(enum q6voice_service_type type,
 					       enum q6voice_path_type path,
 					       struct apr_hdr *hdr);
 void q6voice_session_release(struct q6voice_session *s);
 
-#endif /* _Q6_VOICE_COMMON_H */
+#endif /*_Q6_VOICE_COMMON_H */

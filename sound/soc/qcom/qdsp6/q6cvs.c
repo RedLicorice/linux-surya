@@ -7,35 +7,117 @@
 #include <linux/soc/qcom/apr.h>
 #include <linux/string.h>
 #include "q6cvs.h"
-#include "q6mvm.h"
 #include "q6voice-common.h"
 
 #define VSS_ISTREAM_CMD_CREATE_PASSIVE_CONTROL_SESSION	0x00011140
 
-struct vss_istream_cmd_create_passive_control_session_cmd {
+#define VSS_IVOLUME_CMD_MUTE_V2				0x0001138B
+
+/*
+ * The stream has calibration of its own, separate from the vocproc's, and the
+ * vendor registers it first of the four. Same shape as the vocproc's tables:
+ * a handle, where in it the data starts, and how the rows are indexed.
+ */
+#define VSS_ISTREAM_CMD_REGISTER_STATIC_CALIBRATION_DATA	0x0001307D
+#define VSS_ISTREAM_CMD_REGISTER_CALIBRATION_DATA_V2	0x00011369
+
+#define VSS_MAX_COL_INFO_SIZE				324
+
+struct vss_istream_cmd_register_calibration_data {
 	struct apr_hdr hdr;
 
-	/* The stream name, the same the MVM session was created with */
+	u32 cal_mem_handle;
+	u32 cal_mem_address_lsw;
+	u32 cal_mem_address_msw;
+	u32 cal_mem_size;
+	u8 column_info[VSS_MAX_COL_INFO_SIZE];
+} __packed;
+
+#define VSS_IVOLUME_MUTE_OFF				0
+#define VSS_IVOLUME_MUTE_ON				1
+
+struct vss_ivolume_cmd_mute_v2 {
+	struct apr_hdr hdr;
+
+	u16 direction;
+	u16 mute_flag;
+	u16 ramp_duration_ms;
+} __packed;
+
+struct vss_istream_cmd_create_control_session_cmd {
+	struct apr_hdr hdr;
+
+	/* A variable-sized stream name. */
 	char name[20];
 } __packed;
 
 /*
- * The modem owns the stream (full control); a passive session by the same name
- * gives us a handle to it, which the uplink unmute is sent to.
+ * The stream session is what actually carries voice packets. For a modem-driven
+ * (circuit switched) call it is passive: the modem owns the vocoder and drives
+ * the exchange, we only have to create the session and let the MVM attach it.
+ * Without it the ADSP has a vocproc but no stream to feed, which looks like a
+ * perfectly healthy but completely silent call.
  */
 struct q6voice_session *q6cvs_session_create(enum q6voice_path_type path)
 {
-	struct vss_istream_cmd_create_passive_control_session_cmd cmd = { };
-	const char *session_name = q6mvm_session_name(path);
+	struct vss_istream_cmd_create_control_session_cmd cmd = {0};
+	const char *session_name;
 
 	cmd.hdr.pkt_size = sizeof(cmd);
 	cmd.hdr.opcode = VSS_ISTREAM_CMD_CREATE_PASSIVE_CONTROL_SESSION;
+
+	session_name = q6voice_session_name(path);
 	if (session_name)
 		strscpy(cmd.name, session_name, sizeof(cmd.name));
 
 	return q6voice_session_create(Q6VOICE_SERVICE_CVS, path, &cmd.hdr);
 }
 EXPORT_SYMBOL_GPL(q6cvs_session_create);
+
+/*
+ * Mute state of the stream itself, as opposed to the device. The vendor sends
+ * this for the uplink on every call rather than trusting the ADSP's default.
+ */
+int q6cvs_register_cal(struct q6voice_session *cvs, bool instance,
+		       u32 mem_handle, phys_addr_t phys, u32 size,
+		       const void *col_info, u32 col_size)
+{
+	struct vss_istream_cmd_register_calibration_data cmd = {0};
+
+	if (col_size > sizeof(cmd.column_info))
+		return -EINVAL;
+
+	cmd.hdr.pkt_size = sizeof(cmd);
+	cmd.hdr.opcode = instance ?
+		VSS_ISTREAM_CMD_REGISTER_STATIC_CALIBRATION_DATA :
+		VSS_ISTREAM_CMD_REGISTER_CALIBRATION_DATA_V2;
+
+	cmd.cal_mem_handle = mem_handle;
+	cmd.cal_mem_address_lsw = lower_32_bits(phys);
+	cmd.cal_mem_address_msw = upper_32_bits(phys);
+	cmd.cal_mem_size = size;
+	if (col_size)
+		memcpy(cmd.column_info, col_info, col_size);
+
+	return q6voice_common_send(cvs, &cmd.hdr);
+}
+EXPORT_SYMBOL_GPL(q6cvs_register_cal);
+
+int q6cvs_set_mute(struct q6voice_session *cvs, u16 direction, bool mute,
+		   u16 ramp_ms)
+{
+	struct vss_ivolume_cmd_mute_v2 cmd = {0};
+
+	cmd.hdr.pkt_size = sizeof(cmd);
+	cmd.hdr.opcode = VSS_IVOLUME_CMD_MUTE_V2;
+
+	cmd.direction = direction;
+	cmd.mute_flag = mute ? VSS_IVOLUME_MUTE_ON : VSS_IVOLUME_MUTE_OFF;
+	cmd.ramp_duration_ms = ramp_ms;
+
+	return q6voice_common_send(cvs, &cmd.hdr);
+}
+EXPORT_SYMBOL_GPL(q6cvs_set_mute);
 
 static int q6cvs_probe(struct apr_device *adev)
 {
@@ -62,4 +144,4 @@ module_apr_driver(qcom_q6cvs_driver);
 
 MODULE_AUTHOR("Stephan Gerhold <stephan@gerhold.net>");
 MODULE_DESCRIPTION("Q6 Core Voice Stream");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");
