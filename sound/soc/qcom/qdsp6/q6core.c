@@ -12,6 +12,9 @@
 #include <linux/of_platform.h>
 #include <linux/jiffies.h>
 #include <linux/firmware.h>
+#include <linux/dma-mapping.h>
+#include <linux/platform_device.h>
+#include <linux/unaligned.h>
 #include <linux/soc/qcom/apr.h>
 #include "q6core.h"
 #include "q6dsp-errno.h"
@@ -39,12 +42,6 @@
 #define ACDB_SECTION_DATAPOOL	0x4c4f4f5041544144
 #define ACDB_TOPOLOGIES_BLOB	0x000131a7
 
-struct avcs_cmd_register_topologies {
-	uint32_t payload_addr_lsw;
-	uint32_t payload_addr_msw;
-	uint32_t mem_map_handle;
-	uint32_t payload_size;
-} __packed;
 
 /* AVCS_CMD_REGISTER_TOPOLOGIES and AVCS_CMD_DEREGISTER_TOPOLOGIES (with a mode) */
 struct avcs_cmd_topologies {
@@ -499,38 +496,6 @@ bool q6core_is_adsp_ready(void)
 }
 EXPORT_SYMBOL_GPL(q6core_is_adsp_ready);
 
-static int q6core_register_topologies_inband(struct device *dev, u32 size, const void *data)
-{
-	struct q6core *core = dev_get_drvdata(dev);
-	struct apr_device *adev = core->adev;
-	struct avcs_cmd_register_topologies *cmd;
-	struct apr_pkt *pkt;
-	void *p, *dest;
-	int pkt_size;
-
-	pkt_size = APR_HDR_SIZE + sizeof(*cmd) + size;
-
-	p = kzalloc(pkt_size, GFP_KERNEL);
-	if (!p)
-		return -ENOMEM;
-
-	pkt = p;
-	cmd = p + APR_HDR_SIZE;
-	dest = p + APR_HDR_SIZE + sizeof(*cmd);
-	if (!p)
-		return -ENOMEM;
-
-	pkt->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
-				      APR_HDR_LEN(APR_HDR_SIZE), APR_PKT_VER);
-	pkt->hdr.pkt_size = APR_HDR_SIZE + sizeof(*cmd) + size;
-	pkt->hdr.opcode = AVCS_CMD_REGISTER_TOPOLOGIES;
-	cmd->payload_size = size;
-
-	memcpy(dest, data, size);
-
-	return apr_send_pkt(adev, pkt);
-}
-
 static int acdb_section_offset(const struct firmware *fw,
 			       u64 section, u32 *off_out)
 {
@@ -596,37 +561,124 @@ static int acdb_get_global_property(const struct firmware *fw,
 	return -ENOENT;
 }
 
-static int q6core_load_and_register_topologies(struct device *dev)
+/*
+ * The board's AVCS custom topologies -- the topologies its vendor calibration
+ * names for every service (ADM, voice, LSM) -- registered whenever the core
+ * service comes up, so after every restart of the ADSP too: the DSP forgets
+ * them with everything else. They live in the vendor's Global_cal.acdb
+ * (global property 0x131a7), named by this node's firmware-name.
+ *
+ * The blob is larger than an APR packet takes in band, so it is lent to the
+ * DSP: this node exists for the IOMMU stream it reads the memory through,
+ * which the APR bus does not give its services. Registration replaces
+ * whatever was registered before; it is the only one that does.
+ */
+struct q6core_topologies {
+	struct device *dev;
+	struct work_struct work;
+	u64 sid;
+};
+
+static void q6core_topologies_work(struct work_struct *work)
 {
-	const struct device_node *np = dev_of_node(dev);
-	const char *fw_name;
+	struct q6core_topologies *t = container_of(work, struct q6core_topologies, work);
+	struct device *dev = t->dev;
 	const struct firmware *fw;
-	u32 topo_off, size;
+	const char *fw_name;
+	u32 off, size;
+	dma_addr_t dma;
+	void *cpu;
 	int ret;
 
-	ret = of_property_read_string(np, "qcom,acdb-name", &fw_name);
-	if (ret)
-		return 0;
+	if (of_property_read_string(dev->of_node, "firmware-name", &fw_name))
+		return;
 
-	ret = request_firmware(&fw, fw_name, dev);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to load Global_cal.acdb");
-
-	ret = acdb_get_global_property(fw, ACDB_TOPOLOGIES_BLOB, &topo_off);
-	if (ret) {
-		dev_err(dev, "ACDB parse error: %d\n", ret);
-		goto release_fw;
+	if (!q6core_is_adsp_ready()) {
+		dev_err(dev, "ADSP not ready: custom topologies not registered\n");
+		return;
 	}
 
-	size = *(const u32 *) (fw->data + topo_off);
-	ret = q6core_register_topologies_inband(dev, size, fw->data + topo_off + 4);
-	if (ret < 0)
-		goto release_fw;
+	ret = request_firmware(&fw, fw_name, dev);
+	if (ret) {
+		dev_err(dev, "%s: %d\n", fw_name, ret);
+		return;
+	}
 
-release_fw:
+	ret = acdb_get_global_property(fw, ACDB_TOPOLOGIES_BLOB, &off);
+	if (ret) {
+		dev_err(dev, "%s: no custom topologies: %d\n", fw_name, ret);
+		goto out;
+	}
+	size = get_unaligned_le32(fw->data + off);
+	if (!size || size > fw->size - off - 4) {
+		dev_err(dev, "%s: custom topologies of %u bytes do not fit\n", fw_name, size);
+		goto out;
+	}
+
+	cpu = dma_alloc_coherent(dev, PAGE_ALIGN(size), &dma, GFP_KERNEL);
+	if (!cpu)
+		goto out;
+	memcpy(cpu, fw->data + off + 4, size);
+	ret = q6core_register_topologies(dma | (t->sid << 32), size);
+	dma_free_coherent(dev, PAGE_ALIGN(size), cpu, dma);
+	if (ret)
+		dev_err(dev, "%s: custom topologies refused: %d\n", fw_name, ret);
+	else
+		dev_info(dev, "registered %u bytes of custom topologies from %s\n", size, fw_name);
+out:
 	release_firmware(fw);
+}
+
+static int q6core_topologies_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct q6core_topologies *t;
+	struct of_phandle_args args;
+	int ret;
+
+	t = devm_kzalloc(dev, sizeof(*t), GFP_KERNEL);
+	if (!t)
+		return -ENOMEM;
+
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	if (ret)
+		return dev_err_probe(dev, ret, "no 32-bit DMA\n");
+
+	if (!of_parse_phandle_with_args(dev->of_node, "iommus", "#iommu-cells", 0, &args)) {
+		if (args.args_count)
+			t->sid = args.args[0] & 0xf;
+		of_node_put(args.np);
+	}
+
+	t->dev = dev;
+	INIT_WORK(&t->work, q6core_topologies_work);
+	platform_set_drvdata(pdev, t);
+	/* the core service answers only once its probe is done: not from here */
+	schedule_work(&t->work);
 	return 0;
 }
+
+static void q6core_topologies_remove(struct platform_device *pdev)
+{
+	struct q6core_topologies *t = platform_get_drvdata(pdev);
+
+	cancel_work_sync(&t->work);
+}
+
+static const struct of_device_id q6core_topologies_device_id[] = {
+	{ .compatible = "qcom,q6core-topologies" },
+	{},
+};
+MODULE_DEVICE_TABLE(of, q6core_topologies_device_id);
+
+static struct platform_driver q6core_topologies_driver = {
+	.driver = {
+		.name = "qcom-q6core-topologies",
+		.of_match_table = q6core_topologies_device_id,
+	},
+	.probe = q6core_topologies_probe,
+	.remove = q6core_topologies_remove,
+};
 
 static int q6core_probe(struct apr_device *adev)
 {
@@ -640,12 +692,15 @@ static int q6core_probe(struct apr_device *adev)
 	g_core->adev = adev;
 	init_waitqueue_head(&g_core->wait);
 
-	return q6core_load_and_register_topologies(&adev->dev);
+	/* the topologies node: created with the service, so again after a restart */
+	return of_platform_populate(adev->dev.of_node, NULL, NULL, &adev->dev);
 }
 
 static void q6core_exit(struct apr_device *adev)
 {
 	struct q6core *core = dev_get_drvdata(&adev->dev);
+
+	of_platform_depopulate(&adev->dev);
 
 	if (core->fwk_version_supported)
 		kfree(core->fwk_version);
@@ -674,6 +729,26 @@ static struct apr_driver qcom_q6core_driver = {
 	},
 };
 
-module_apr_driver(qcom_q6core_driver);
+static int __init q6core_init(void)
+{
+	int ret;
+
+	ret = platform_driver_register(&q6core_topologies_driver);
+	if (ret)
+		return ret;
+
+	ret = apr_driver_register(&qcom_q6core_driver);
+	if (ret)
+		platform_driver_unregister(&q6core_topologies_driver);
+	return ret;
+}
+module_init(q6core_init);
+
+static void __exit q6core_exit_module(void)
+{
+	apr_driver_unregister(&qcom_q6core_driver);
+	platform_driver_unregister(&q6core_topologies_driver);
+}
+module_exit(q6core_exit_module);
 MODULE_DESCRIPTION("q6 core");
 MODULE_LICENSE("GPL v2");
