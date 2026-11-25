@@ -243,7 +243,7 @@ static int q6core_avcs_cmd(struct q6core *core, struct apr_hdr *hdr)
  *
  * Return: 0, or a negative errno.
  */
-int q6core_register_topologies(u64 dsp_addr, u32 size)
+static int q6core_register_topologies(u64 dsp_addr, u32 size)
 {
 	struct avcs_cmd_shared_mem_map_regions map = {};
 	struct avcs_cmd_shared_mem_unmap_regions unmap = {};
@@ -289,7 +289,6 @@ out:
 	mutex_unlock(&core->lock);
 	return rc;
 }
-EXPORT_SYMBOL_GPL(q6core_register_topologies);
 
 /**
  * q6core_load_topology() - have the DSP load (or unload) the modules of one topology before a service opens it

@@ -341,18 +341,11 @@ static int q6voice_path_start(struct q6voice_path *p)
 			goto topology_ready;
 
 		/*
-		 * Only the vendor's own topologies live in this blob. Failing to
-		 * register it must not take the call down: the stock topology
-		 * ids need it, but Qualcomm's generic ones do not, and refusing
-		 * to start left no way to try them. Warn and carry on -- if the
-		 * chosen topology really did need the blob, the vocproc create
-		 * that follows says so.
+		 * The vendor's own topology ids need its custom topologies,
+		 * which the core service registered when the ADSP came up
+		 * (q6core's topologies node); Qualcomm's generic ones do not.
+		 * If a chosen one is missing, the vocproc create says so.
 		 */
-		ret = q6voice_cal_register_topologies();
-		if (ret)
-			dev_warn(dev, "custom topology registration failed: %d\n",
-				 ret);
-
 		dev_info(dev, "preload CVD topology modules tx %#010x rx %#010x\n",
 			 tx_topology, rx_topology);
 		ret = q6core_load_topology(rx_topology, true);

@@ -11,7 +11,7 @@ struct q6voice_session;
 
 /*
  * A call's calibration files, in the calibration node's firmware-name
- * directory: stream.bin, topologies.bin, and per pair of ACDB devices
+ * directory: stream.bin, and per pair of ACDB devices
  * <kind>-<tx>-<rx>.bin (devcfg, vocproc, volume; the ids as four hex digits).
  */
 enum q6voice_cal_file {
@@ -19,7 +19,6 @@ enum q6voice_cal_file {
 	Q6VOICE_CAL_DEV_CFG,	/* what the endpoints are */
 	Q6VOICE_CAL_VOCPROC,	/* the vocproc, other than by step */
 	Q6VOICE_CAL_VOLUME,	/* the vocproc, per volume step */
-	Q6VOICE_CAL_TOPOLOGIES,	/* the board's AVCS custom topologies */
 	Q6VOICE_CAL_FILE_COUNT,
 };
 
@@ -29,7 +28,6 @@ enum q6voice_cal_file {
  */
 const char *q6voice_cal_firmware(char *buf, size_t len,
 				 enum q6voice_cal_file file, u32 tx, u32 rx);
-int q6voice_cal_register_topologies(void);
 
 /*
  * Returns NULL when no calibration is installed for the board, which callers

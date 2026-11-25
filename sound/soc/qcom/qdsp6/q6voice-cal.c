@@ -85,15 +85,12 @@ static struct device *q6voice_cal_dev;
 
 /* The board's calibration directory (the node's firmware-name), or NULL. */
 static const char *q6voice_cal_dir;
-static bool q6voice_cal_topologies_registered;
-static DEFINE_MUTEX(q6voice_cal_topologies_lock);
 
 static const char * const q6voice_cal_kind[Q6VOICE_CAL_FILE_COUNT] = {
 	[Q6VOICE_CAL_STREAM] = "stream",
 	[Q6VOICE_CAL_DEV_CFG] = "devcfg",
 	[Q6VOICE_CAL_VOCPROC] = "vocproc",
 	[Q6VOICE_CAL_VOLUME] = "volume",
-	[Q6VOICE_CAL_TOPOLOGIES] = "topologies",
 };
 
 const char *q6voice_cal_firmware(char *buf, size_t len,
@@ -119,64 +116,6 @@ const char *q6voice_cal_firmware(char *buf, size_t len,
 	return buf;
 }
 EXPORT_SYMBOL_GPL(q6voice_cal_firmware);
-
-/*
- * The board's own AVCS topologies (Android sends them as
- * CORE_CUSTOM_TOPOLOGIES_CAL_TYPE before CVD loads OEM topology ids). Placed in
- * this device's domain, the one the ADSP reads calibration through, and handed
- * to the core service once per boot.
- */
-int q6voice_cal_register_topologies(void)
-{
-	char fw_name[128];
-	const char *name = q6voice_cal_firmware(fw_name, sizeof(fw_name),
-						Q6VOICE_CAL_TOPOLOGIES, 0, 0);
-	const struct firmware *fw;
-	struct device *dev = q6voice_cal_dev;
-	dma_addr_t iova;
-	size_t size;
-	void *buf;
-	int ret;
-
-	if (!name)
-		return 0;
-	if (!dev)
-		return -ENODEV;
-
-	mutex_lock(&q6voice_cal_topologies_lock);
-	if (q6voice_cal_topologies_registered) {
-		ret = 0;
-		goto out;
-	}
-
-	ret = request_firmware(&fw, name, dev);
-	if (ret)
-		goto out;
-
-	size = PAGE_ALIGN(fw->size);
-	buf = fw->size ? dma_alloc_coherent(dev, size, &iova, GFP_KERNEL) : NULL;
-	if (!buf) {
-		ret = fw->size ? -ENOMEM : -EINVAL;
-		release_firmware(fw);
-		goto out;
-	}
-	memcpy(buf, fw->data, fw->size);
-
-	ret = q6core_register_topologies(q6voice_dsp_address(dev, iova),
-					 fw->size);
-	if (!ret) {
-		q6voice_cal_topologies_registered = true;
-		dev_info(dev, "registered %zu bytes of custom topologies from %s\n",
-			 fw->size, name);
-	}
-
-	dma_free_coherent(dev, size, buf, iova);
-	release_firmware(fw);
-out:
-	mutex_unlock(&q6voice_cal_topologies_lock);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(q6voice_cal_register_topologies);
 
 /*
  * What the ADSP expects to find at the address given to
@@ -482,7 +421,6 @@ static void q6voice_cal_remove(struct platform_device *pdev)
 {
 	q6voice_cal_dev = NULL;
 	q6voice_cal_dir = NULL;
-	q6voice_cal_topologies_registered = false;
 }
 
 static const struct of_device_id q6voice_cal_device_id[] = {

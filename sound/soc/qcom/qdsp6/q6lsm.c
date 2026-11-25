@@ -523,40 +523,32 @@ static int q6lsm_register_model(struct q6lsm *lsm, const struct q6lsm_model *m)
  */
 static int q6lsm_add_topologies(struct q6lsm *lsm, const struct q6lsm_model *m)
 {
-	dma_addr_t dma;
-	size_t size;
-	void *cpu;
+	struct lsm_cmd_add_topologies cmd = {};
+	struct q6lsm_buf *buf;
 	int ret;
 
 	if (!lsm->mem_dev)
 		return -ENODEV;
 	if (!m->size || m->size > max_oob_bytes)
 		return -EINVAL;
-	if (m->reserved & Q6LSM_TOPOLOGIES_LSM) {	/* the LSM service's own table, mapped for the session */
-		struct lsm_cmd_add_topologies cmd = {};
-		struct q6lsm_buf *buf;
+	/*
+	 * The global table (the core service's) is the core's own: it registers
+	 * the board's at every ADSP start (q6core's topologies node). Only the
+	 * LSM service's table comes from here, mapped for the session.
+	 */
+	if (!(m->reserved & Q6LSM_TOPOLOGIES_LSM))
+		return -EOPNOTSUPP;
 
-		ret = q6lsm_map(lsm, u64_to_user_ptr(m->data), m->size, &buf);
-		if (ret)
-			return ret;
-		q6lsm_hdr(&cmd.hdr, sizeof(cmd), LSM_CMD_ADD_TOPOLOGIES);
-		cmd.hdr.dest_port = 0;
-		cmd.addr_lsw = lower_32_bits(buf->dsp_addr);
-		cmd.addr_msw = upper_32_bits(buf->dsp_addr);
-		cmd.mem_map_handle = buf->handle;
-		cmd.size = m->size;
-		return q6lsm_send(lsm, &cmd.hdr);
-	}
-	size = PAGE_ALIGN(m->size);
-	cpu = dma_alloc_coherent(lsm->mem_dev, size, &dma, GFP_KERNEL);
-	if (!cpu)
-		return -ENOMEM;
-	if (copy_from_user(cpu, u64_to_user_ptr(m->data), m->size))
-		ret = -EFAULT;
-	else
-		ret = q6core_register_topologies(lsm->sid < 0 ? dma : dma | ((u64)lsm->sid << 32), m->size);
-	dma_free_coherent(lsm->mem_dev, size, cpu, dma);
-	return ret;
+	ret = q6lsm_map(lsm, u64_to_user_ptr(m->data), m->size, &buf);
+	if (ret)
+		return ret;
+	q6lsm_hdr(&cmd.hdr, sizeof(cmd), LSM_CMD_ADD_TOPOLOGIES);
+	cmd.hdr.dest_port = 0;
+	cmd.addr_lsw = lower_32_bits(buf->dsp_addr);
+	cmd.addr_msw = upper_32_bits(buf->dsp_addr);
+	cmd.mem_map_handle = buf->handle;
+	cmd.size = m->size;
+	return q6lsm_send(lsm, &cmd.hdr);
 }
 
 /* Back to nothing: stopped, closed, every mapping gone. Errors are logged; the DSP's state is reset anyway. */

@@ -73,9 +73,10 @@ struct q6lsm_event {
 #define Q6LSM_IOC_START			_IO(Q6LSM_IOC_MAGIC, 0x04)
 #define Q6LSM_IOC_STOP			_IO(Q6LSM_IOC_MAGIC, 0x05)
 /*
- * the vendor calibration's custom topologies blob (data/size as for a model), before an open that names one: to the
- * core service (AVCS, the global table), or with Q6LSM_TOPOLOGIES_LSM in the model's reserved field to the LSM service
- * (LSM_CMD_ADD_TOPOLOGIES, the LSM table: fixed-size entries)
+ * the vendor calibration's LSM topologies table (data/size as for a model), before an open that names one, with
+ * Q6LSM_TOPOLOGIES_LSM in the model's reserved field: to the LSM service (LSM_CMD_ADD_TOPOLOGIES, fixed-size
+ * entries). Without the flag (the core service's global table) -EOPNOTSUPP: the kernel registers that one itself at
+ * every ADSP start (q6core's topologies node).
  */
 #define Q6LSM_TOPOLOGIES_LSM	(1 << 0)
 #define Q6LSM_IOC_ADD_TOPOLOGIES	_IOW(Q6LSM_IOC_MAGIC, 0x06, struct q6lsm_model)
