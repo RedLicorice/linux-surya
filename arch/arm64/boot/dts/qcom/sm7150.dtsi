@@ -4391,6 +4391,17 @@
 				compatible = "qcom,pil-reloc-info";
 				reg = <0x94c 0xc8>;
 			};
+
+			/*
+			 * ABL reads the restart reason from IMEM (downstream's restart_reason@65c
+			 * and msm-poweroff values), not from the PON spare register alone
+			 */
+			reboot-mode {
+				compatible = "syscon-reboot-mode";
+				offset = <0x65c>;
+				mode-bootloader = <0x77665500>;
+				mode-recovery = <0x77665502>;
+			};
 		};
 
 		apps_smmu: iommu@15000000 {
