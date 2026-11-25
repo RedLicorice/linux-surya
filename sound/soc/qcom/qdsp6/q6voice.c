@@ -27,6 +27,8 @@ struct q6voice_path_runtime {
 	int setup_level;
 	int cal_level;
 	bool attach_stream;
+	/* the path's call data (q6voice_param), likewise */
+	struct q6cvp_config cvp_cfg;
 
 	/*
 	 * Calibration lent through this call's MVM session. The handles
@@ -45,6 +47,8 @@ struct q6voice_path {
 
 	enum q6voice_path_type type;
 	int tx_port, rx_port;
+	/* the board's data for the next call (q6voice_param), set by userspace */
+	u32 params[Q6VOICE_PARAM_COUNT];
 	/* Serialize access to voice path session */
 	struct mutex lock;
 	struct q6voice_path_runtime *runtime;
@@ -234,7 +238,14 @@ static int q6voice_path_start(struct q6voice_path *p)
 
 	rt->setup_level = READ_ONCE(setup_level);
 	rt->cal_level = READ_ONCE(cal_level);
-	rt->attach_stream = READ_ONCE(rt->attach_stream);
+	rt->attach_stream = READ_ONCE(attach_stream);
+	/* p->lock is held: the controls cannot change these halfway */
+	rt->cvp_cfg.tx_topology = p->params[Q6VOICE_TX_TOPOLOGY];
+	rt->cvp_cfg.rx_topology = p->params[Q6VOICE_RX_TOPOLOGY];
+	rt->cvp_cfg.tx_channels = p->params[Q6VOICE_TX_CHANNELS];
+	dev_info(dev, "call data: tx topology %#010x rx topology %#010x tx channels %u\n",
+		 rt->cvp_cfg.tx_topology, rt->cvp_cfg.rx_topology,
+		 rt->cvp_cfg.tx_channels);
 
 	dev_info(dev, "start path %d, setup level %d\n", p->type,
 		 rt->setup_level);
@@ -320,7 +331,8 @@ static int q6voice_path_start(struct q6voice_path *p)
 	 * ADSP sees topology preload before any CVP state exists.
 	 */
 	if (rt->setup_level == 0) {
-		q6cvp_get_topologies(&tx_topology, &rx_topology);
+		tx_topology = rt->cvp_cfg.tx_topology;
+		rx_topology = rt->cvp_cfg.rx_topology;
 		if (tx_topology == VSS_IVOCPROC_TOPOLOGY_ID_NONE &&
 		    rx_topology == VSS_IVOCPROC_TOPOLOGY_ID_NONE)
 			goto topology_ready;
@@ -355,7 +367,8 @@ topology_ready:
 		cvp = q6cvp_session_create(p->type,
 					   q6afe_get_port_id(p->tx_port),
 					   q6afe_get_port_id(p->rx_port),
-					   q6voice_cvp_create_v3(p->v->cvd_version));
+					   q6voice_cvp_create_v3(p->v->cvd_version),
+					   &rt->cvp_cfg);
 		if (IS_ERR(cvp)) {
 			ret = PTR_ERR(cvp);
 			goto stream_err;
@@ -370,7 +383,7 @@ topology_ready:
 	 * Describe both directions before committing: the ADSP refuses the
 	 * commit until it knows the channel layout of each side.
 	 */
-	ret = q6cvp_set_channel_info(cvp);
+	ret = q6cvp_set_channel_info(cvp, &rt->cvp_cfg);
 	if (ret)
 		dev_warn(dev, "set channel info failed: %d\n", ret);
 
@@ -379,7 +392,7 @@ topology_ready:
 	 * the topology can be committed.
 	 */
 	ret = q6cvp_set_media_format(cvp, q6afe_get_port_id(p->tx_port),
-				     q6afe_get_port_id(p->rx_port));
+				     q6afe_get_port_id(p->rx_port), &rt->cvp_cfg);
 	if (ret)
 		dev_warn(dev, "set media format failed: %d\n", ret);
 
@@ -689,6 +702,10 @@ struct q6voice *q6voice_create(struct device *dev)
 
 		p->v = v;
 		p->type = path;
+		/* no board data: the pass-through, one microphone */
+		p->params[Q6VOICE_TX_TOPOLOGY] = VSS_IVOCPROC_TOPOLOGY_ID_NONE;
+		p->params[Q6VOICE_RX_TOPOLOGY] = VSS_IVOCPROC_TOPOLOGY_ID_NONE;
+		p->params[Q6VOICE_TX_CHANNELS] = 1;
 		mutex_init(&p->lock);
 	}
 
@@ -723,6 +740,31 @@ void q6voice_set_port(struct q6voice *v, enum q6voice_path_type path,
 		p->rx_port = index;
 }
 EXPORT_SYMBOL_GPL(q6voice_set_port);
+
+u32 q6voice_get_param(struct q6voice *v, enum q6voice_path_type path,
+		      enum q6voice_param param)
+{
+	struct q6voice_path *p = &v->paths[path];
+	u32 val;
+
+	mutex_lock(&p->lock);
+	val = p->params[param];
+	mutex_unlock(&p->lock);
+	return val;
+}
+EXPORT_SYMBOL_GPL(q6voice_get_param);
+
+/* Takes effect at the next call start: a running vocproc keeps its setup. */
+void q6voice_set_param(struct q6voice *v, enum q6voice_path_type path,
+		       enum q6voice_param param, u32 val)
+{
+	struct q6voice_path *p = &v->paths[path];
+
+	mutex_lock(&p->lock);
+	p->params[param] = val;
+	mutex_unlock(&p->lock);
+}
+EXPORT_SYMBOL_GPL(q6voice_set_param);
 
 MODULE_AUTHOR("Stephan Gerhold <stephan@gerhold.net>");
 MODULE_DESCRIPTION("Q6Voice driver");

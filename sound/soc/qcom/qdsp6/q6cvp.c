@@ -325,42 +325,10 @@ module_param(ec_ref_port, uint, 0644);
 MODULE_PARM_DESC(ec_ref_port,
 		 "AFE port to use as the echo reference (0 = internal mixing).");
 
-static bool bypass_topology = true;
-module_param(bypass_topology, bool, 0644);
-MODULE_PARM_DESC(bypass_topology,
-		 "Create the vocproc with no processing topology (default), rather than the echo-cancelling one, which needs calibration this driver cannot supply yet.");
-
-/*
- * OEM CVD firmware can provide different processing topology IDs from the
- * generic SM-ECNS / RX-default pair.  Keep the generic defaults for
- * existing boards, but let a board-specific boot service supply the IDs
- * captured from its stock voice stack before the first call.
- */
-static unsigned int tx_topology = VSS_IVOCPROC_TOPOLOGY_ID_TX_SM_ECNS;
-module_param(tx_topology, uint, 0644);
-MODULE_PARM_DESC(tx_topology,
-		 "CVP transmit processing topology when bypass_topology is disabled.");
-
-static unsigned int rx_topology = VSS_IVOCPROC_TOPOLOGY_ID_RX_DEFAULT;
-module_param(rx_topology, uint, 0644);
-MODULE_PARM_DESC(rx_topology,
-		 "CVP receive processing topology when bypass_topology is disabled.");
-
-void q6cvp_get_topologies(u32 *tx_topology_id, u32 *rx_topology_id)
-{
-	if (bypass_topology) {
-		*tx_topology_id = VSS_IVOCPROC_TOPOLOGY_ID_NONE;
-		*rx_topology_id = VSS_IVOCPROC_TOPOLOGY_ID_NONE;
-	} else {
-		*tx_topology_id = tx_topology;
-		*rx_topology_id = rx_topology;
-	}
-}
-EXPORT_SYMBOL_GPL(q6cvp_get_topologies);
-
 struct q6voice_session *q6cvp_session_create(enum q6voice_path_type path,
 					     u16 tx_port, u16 rx_port,
-					     bool create_v3)
+					     bool create_v3,
+					     const struct q6cvp_config *cfg)
 {
 	/*
 	 * Zeroed rather than field-by-field: the trailing name is optional and
@@ -377,12 +345,12 @@ struct q6voice_session *q6cvp_session_create(enum q6voice_path_type path,
 
 	/*
 	 * The processing topologies are chains of modules -- echo cancellation,
-	 * noise suppression -- that expect their parameters to come from
-	 * calibration we do not have. Asking for them without it gets a vocproc
-	 * that is created, enabled, and produces nothing. NONE is the
-	 * pass-through: no modules, no parameters, just the audio.
+	 * noise suppression -- whose parameters come from the call's
+	 * calibration. Which ones is the board's data (the vendor's ACDB, set
+	 * by userspace per call); NONE, the default, is the pass-through.
 	 */
-	q6cvp_get_topologies(&cmd.tx_topology_id, &cmd.rx_topology_id);
+	cmd.tx_topology_id = cfg->tx_topology;
+	cmd.rx_topology_id = cfg->rx_topology;
 
 	cmd.direction = VSS_IVOCPROC_DIRECTION_RX_TX;
 	cmd.tx_port_id = tx_port;
@@ -434,27 +402,6 @@ static unsigned int rx_channels = 2;
 module_param(rx_channels, uint, 0644);
 MODULE_PARM_DESC(rx_channels, "Channel count of the vocproc's render port.");
 
-/*
- * One channel, because the vocproc has no topology.
- *
- * The stock system runs this port with two -- the top mic carries speech and
- * the bottom one is an echo reference -- but that only makes sense with a
- * dual-mic processing topology to combine them, and this ADSP will not commit
- * one: its own 0x1000FFFC needs a custom-topology blob it rejects as
- * EBADPARAM, and the generic TX_DM_FLUENCE fails TOPOLOGY_COMMIT outright with
- * EFAILED. With VSS_IVOCPROC_TOPOLOGY_ID_NONE there is no block to merge two
- * microphones into the single stream the vocoder encodes, and asking for two
- * leaves the uplink silent.
- *
- * The backend still runs both mics; taking one channel takes the first, which
- * is DEC0 -- AMIC5, the top mic, the speech one. Uplink is therefore
- * unprocessed: no echo cancellation or noise suppression until the custom
- * topology can be registered.
- */
-static unsigned int tx_channels = 1;
-module_param(tx_channels, uint, 0644);
-MODULE_PARM_DESC(tx_channels, "Channel count of the vocproc's capture port.");
-
 static unsigned int rx_bits = 24;
 module_param(rx_bits, uint, 0644);
 MODULE_PARM_DESC(rx_bits, "Sample width of the vocproc's render port.");
@@ -499,7 +446,8 @@ static int q6cvp_set_channel_info_one(struct q6voice_session *cvp, u32 param_id,
 	return q6voice_common_send(cvp, &cmd.hdr);
 }
 
-int q6cvp_set_channel_info(struct q6voice_session *cvp)
+int q6cvp_set_channel_info(struct q6voice_session *cvp,
+			   const struct q6cvp_config *cfg)
 {
 	int ret;
 
@@ -509,7 +457,7 @@ int q6cvp_set_channel_info(struct q6voice_session *cvp)
 		return ret;
 
 	ret = q6cvp_set_channel_info_one(cvp, VSS_PARAM_VOCPROC_TX_CHANNEL_INFO,
-					 tx_channels, tx_bits);
+					 cfg->tx_channels, tx_bits);
 	if (ret)
 		return ret;
 
@@ -556,7 +504,8 @@ static int q6cvp_set_media_format_one(struct q6voice_session *cvp, u32 param_id,
 	return q6voice_common_send(cvp, &cmd.hdr);
 }
 
-int q6cvp_set_media_format(struct q6voice_session *cvp, u16 tx_port, u16 rx_port)
+int q6cvp_set_media_format(struct q6voice_session *cvp, u16 tx_port, u16 rx_port,
+			   const struct q6cvp_config *cfg)
 {
 	int ret;
 
@@ -568,7 +517,7 @@ int q6cvp_set_media_format(struct q6voice_session *cvp, u16 tx_port, u16 rx_port
 
 	ret = q6cvp_set_media_format_one(cvp,
 					 VSS_PARAM_TX_PORT_ENDPOINT_MEDIA_INFO,
-					 tx_port, tx_rate, tx_channels, tx_bits);
+					 tx_port, tx_rate, cfg->tx_channels, tx_bits);
 	if (ret)
 		return ret;
 

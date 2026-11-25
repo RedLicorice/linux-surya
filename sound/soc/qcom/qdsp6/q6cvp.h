@@ -11,12 +11,21 @@
 
 struct q6voice_session;
 
+/* One call's vocproc, as the board's data describes it (q6voice_param). */
+struct q6cvp_config {
+	u32 tx_topology;
+	u32 rx_topology;
+	unsigned int tx_channels;
+};
+
 struct q6voice_session *q6cvp_session_create(enum q6voice_path_type path,
 					     u16 tx_port, u16 rx_port,
-					     bool create_v3);
-void q6cvp_get_topologies(u32 *tx_topology_id, u32 *rx_topology_id);
-int q6cvp_set_channel_info(struct q6voice_session *cvp);
-int q6cvp_set_media_format(struct q6voice_session *cvp, u16 tx_port, u16 rx_port);
+					     bool create_v3,
+					     const struct q6cvp_config *cfg);
+int q6cvp_set_channel_info(struct q6voice_session *cvp,
+			   const struct q6cvp_config *cfg);
+int q6cvp_set_media_format(struct q6voice_session *cvp, u16 tx_port, u16 rx_port,
+			   const struct q6cvp_config *cfg);
 int q6cvp_topology_commit(struct q6voice_session *cvp);
 int q6cvp_set_rx_volume(struct q6voice_session *cvp, u32 step, u16 ramp_ms);
 int q6cvp_set_device_mute(struct q6voice_session *cvp, u16 direction, bool mute,

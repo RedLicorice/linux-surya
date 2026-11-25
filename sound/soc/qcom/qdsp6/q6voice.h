@@ -23,6 +23,17 @@ enum q6voice_path_type {
 
 struct q6voice;
 
+/*
+ * What a call is set up with, per path: the board's data, set by userspace
+ * (the UCM's call verb) and read when the call starts.
+ */
+enum q6voice_param {
+	Q6VOICE_TX_TOPOLOGY,	/* vocproc capture topology id */
+	Q6VOICE_RX_TOPOLOGY,	/* vocproc render topology id */
+	Q6VOICE_TX_CHANNELS,	/* microphone channels the vocproc takes */
+	Q6VOICE_PARAM_COUNT,
+};
+
 struct q6voice *q6voice_create(struct device *dev);
 int q6voice_start(struct q6voice *v, enum q6voice_path_type path, bool capture);
 int q6voice_stop(struct q6voice *v, enum q6voice_path_type path, bool capture);
@@ -32,5 +43,9 @@ int q6voice_get_port(struct q6voice *v, enum q6voice_path_type path,
 		     bool capture);
 void q6voice_set_port(struct q6voice *v, enum q6voice_path_type path,
 		      bool capture, int index);
+u32 q6voice_get_param(struct q6voice *v, enum q6voice_path_type path,
+		      enum q6voice_param param);
+void q6voice_set_param(struct q6voice *v, enum q6voice_path_type path,
+		       enum q6voice_param param, u32 val);
 
 #endif /*_Q6_VOICE_H */

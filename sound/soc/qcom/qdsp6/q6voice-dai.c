@@ -276,6 +276,51 @@ static const struct snd_soc_dapm_route q6voice_dapm_routes[] = {
 	{ "RX_CODEC_DMA_RX_0",		NULL,	"RX_CODEC_DMA_RX_0 Voice Mixer" },
 };
 
+/*
+ * The call's board data (q6voice_param): which vocproc topologies, how many
+ * microphone channels. Userspace sets them with the call's routing (the UCM
+ * verb); they are read when the call starts.
+ */
+static int q6voice_get_param_kctrl(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *c = snd_kcontrol_chip(kcontrol);
+	struct soc_mixer_control *mc = (void *)kcontrol->private_value;
+	struct q6voice *v = snd_soc_component_get_drvdata(c);
+
+	ucontrol->value.integer.value[0] =
+		q6voice_get_param(v, Q6VOICE_PATH_VOICE, mc->reg);
+	return 0;
+}
+
+static int q6voice_put_param_kctrl(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *c = snd_kcontrol_chip(kcontrol);
+	struct soc_mixer_control *mc = (void *)kcontrol->private_value;
+	struct q6voice *v = snd_soc_component_get_drvdata(c);
+	long val = ucontrol->value.integer.value[0];
+
+	if (val < 0 || val > mc->max)
+		return -EINVAL;
+	if (mc->reg == Q6VOICE_TX_CHANNELS && val < 1)
+		return -EINVAL;
+	if (q6voice_get_param(v, Q6VOICE_PATH_VOICE, mc->reg) == val)
+		return 0;
+
+	q6voice_set_param(v, Q6VOICE_PATH_VOICE, mc->reg, val);
+	return 1;
+}
+
+static const struct snd_kcontrol_new q6voice_controls[] = {
+	SOC_SINGLE_EXT("Voice TX Topology", Q6VOICE_TX_TOPOLOGY, 0, INT_MAX, 0,
+		       q6voice_get_param_kctrl, q6voice_put_param_kctrl),
+	SOC_SINGLE_EXT("Voice RX Topology", Q6VOICE_RX_TOPOLOGY, 0, INT_MAX, 0,
+		       q6voice_get_param_kctrl, q6voice_put_param_kctrl),
+	SOC_SINGLE_EXT("Voice TX Channels", Q6VOICE_TX_CHANNELS, 0, 8, 0,
+		       q6voice_get_param_kctrl, q6voice_put_param_kctrl),
+};
+
 static unsigned int q6voice_reg_read(struct snd_soc_component *component,
 				     unsigned int reg)
 {
@@ -303,6 +348,8 @@ static const struct snd_soc_component_driver q6voice_dai_component = {
 	.num_dapm_widgets = ARRAY_SIZE(q6voice_dapm_widgets),
 	.dapm_routes = q6voice_dapm_routes,
 	.num_dapm_routes = ARRAY_SIZE(q6voice_dapm_routes),
+	.controls = q6voice_controls,
+	.num_controls = ARRAY_SIZE(q6voice_controls),
 	.read = q6voice_reg_read,
 	.write = q6voice_reg_write,
 
