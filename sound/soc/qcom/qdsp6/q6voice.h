@@ -31,6 +31,8 @@ enum q6voice_param {
 	Q6VOICE_TX_TOPOLOGY,	/* vocproc capture topology id */
 	Q6VOICE_RX_TOPOLOGY,	/* vocproc render topology id */
 	Q6VOICE_TX_CHANNELS,	/* microphone channels the vocproc takes */
+	Q6VOICE_TX_ACDB_DEVICE,	/* the vendor ACDB's capture device: calibration */
+	Q6VOICE_RX_ACDB_DEVICE,	/* the vendor ACDB's render device: calibration */
 	Q6VOICE_PARAM_COUNT,
 };
 

@@ -29,6 +29,7 @@ struct q6voice_path_runtime {
 	bool attach_stream;
 	/* the path's call data (q6voice_param), likewise */
 	struct q6cvp_config cvp_cfg;
+	u32 tx_acdb, rx_acdb;
 
 	/*
 	 * Calibration lent through this call's MVM session. The handles
@@ -243,9 +244,11 @@ static int q6voice_path_start(struct q6voice_path *p)
 	rt->cvp_cfg.tx_topology = p->params[Q6VOICE_TX_TOPOLOGY];
 	rt->cvp_cfg.rx_topology = p->params[Q6VOICE_RX_TOPOLOGY];
 	rt->cvp_cfg.tx_channels = p->params[Q6VOICE_TX_CHANNELS];
-	dev_info(dev, "call data: tx topology %#010x rx topology %#010x tx channels %u\n",
+	rt->tx_acdb = p->params[Q6VOICE_TX_ACDB_DEVICE];
+	rt->rx_acdb = p->params[Q6VOICE_RX_ACDB_DEVICE];
+	dev_info(dev, "call data: tx topology %#010x rx topology %#010x tx channels %u acdb devices %#x %#x\n",
 		 rt->cvp_cfg.tx_topology, rt->cvp_cfg.rx_topology,
-		 rt->cvp_cfg.tx_channels);
+		 rt->cvp_cfg.tx_channels, rt->tx_acdb, rt->rx_acdb);
 
 	dev_info(dev, "start path %d, setup level %d\n", p->type,
 		 rt->setup_level);
@@ -423,14 +426,23 @@ topology_ready:
 	if (rt->cal_level >= Q6VOICE_CAL_LEND) {
 		q6voice_path_free_cal(p);
 
+		char name[128];
+
 		rt->stream_cal = q6voice_cal_load(dev,
-				q6voice_cal_firmware(Q6VOICE_CAL_STREAM), mvm);
+				q6voice_cal_firmware(name, sizeof(name),
+						     Q6VOICE_CAL_STREAM, 0, 0), mvm);
 		rt->dev_cfg = q6voice_cal_load(dev,
-				q6voice_cal_firmware(Q6VOICE_CAL_DEV_CFG), mvm);
+				q6voice_cal_firmware(name, sizeof(name),
+						     Q6VOICE_CAL_DEV_CFG,
+						     rt->tx_acdb, rt->rx_acdb), mvm);
 		rt->cal = q6voice_cal_load(dev,
-				q6voice_cal_firmware(Q6VOICE_CAL_VOCPROC), mvm);
+				q6voice_cal_firmware(name, sizeof(name),
+						     Q6VOICE_CAL_VOCPROC,
+						     rt->tx_acdb, rt->rx_acdb), mvm);
 		rt->vol_cal = q6voice_cal_load(dev,
-				q6voice_cal_firmware(Q6VOICE_CAL_VOLUME), mvm);
+				q6voice_cal_firmware(name, sizeof(name),
+						     Q6VOICE_CAL_VOLUME,
+						     rt->tx_acdb, rt->rx_acdb), mvm);
 	}
 
 	if (rt->cal_level >= Q6VOICE_CAL_REGISTER) {

@@ -319,6 +319,10 @@ static const struct snd_kcontrol_new q6voice_controls[] = {
 		       q6voice_get_param_kctrl, q6voice_put_param_kctrl),
 	SOC_SINGLE_EXT("Voice TX Channels", Q6VOICE_TX_CHANNELS, 0, 8, 0,
 		       q6voice_get_param_kctrl, q6voice_put_param_kctrl),
+	SOC_SINGLE_EXT("Voice TX ACDB Device", Q6VOICE_TX_ACDB_DEVICE, 0, 0xffff, 0,
+		       q6voice_get_param_kctrl, q6voice_put_param_kctrl),
+	SOC_SINGLE_EXT("Voice RX ACDB Device", Q6VOICE_RX_ACDB_DEVICE, 0, 0xffff, 0,
+		       q6voice_get_param_kctrl, q6voice_put_param_kctrl),
 };
 
 static unsigned int q6voice_reg_read(struct snd_soc_component *component,

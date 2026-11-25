@@ -83,21 +83,40 @@ struct q6voice_cal {
  */
 static struct device *q6voice_cal_dev;
 
-/*
- * The board's calibration files, from the node's firmware-name list in the
- * order of enum q6voice_cal_file; a missing or empty entry means none.
- */
-static const char *q6voice_cal_names[Q6VOICE_CAL_FILE_COUNT];
+/* The board's calibration directory (the node's firmware-name), or NULL. */
+static const char *q6voice_cal_dir;
 static bool q6voice_cal_topologies_registered;
 static DEFINE_MUTEX(q6voice_cal_topologies_lock);
 
-const char *q6voice_cal_firmware(enum q6voice_cal_file file)
+static const char * const q6voice_cal_kind[Q6VOICE_CAL_FILE_COUNT] = {
+	[Q6VOICE_CAL_STREAM] = "stream",
+	[Q6VOICE_CAL_DEV_CFG] = "devcfg",
+	[Q6VOICE_CAL_VOCPROC] = "vocproc",
+	[Q6VOICE_CAL_VOLUME] = "volume",
+	[Q6VOICE_CAL_TOPOLOGIES] = "topologies",
+};
+
+const char *q6voice_cal_firmware(char *buf, size_t len,
+				 enum q6voice_cal_file file, u32 tx, u32 rx)
 {
-	if (file >= Q6VOICE_CAL_FILE_COUNT || !q6voice_cal_names[file] ||
-	    !*q6voice_cal_names[file])
+	if (file >= Q6VOICE_CAL_FILE_COUNT || !q6voice_cal_dir)
 		return NULL;
 
-	return q6voice_cal_names[file];
+	switch (file) {
+	case Q6VOICE_CAL_DEV_CFG:
+	case Q6VOICE_CAL_VOCPROC:
+	case Q6VOICE_CAL_VOLUME:
+		if (!tx || !rx)
+			return NULL;
+		snprintf(buf, len, "%s/%s-%04x-%04x.bin", q6voice_cal_dir,
+			 q6voice_cal_kind[file], tx, rx);
+		break;
+	default:
+		snprintf(buf, len, "%s/%s.bin", q6voice_cal_dir,
+			 q6voice_cal_kind[file]);
+		break;
+	}
+	return buf;
 }
 EXPORT_SYMBOL_GPL(q6voice_cal_firmware);
 
@@ -109,7 +128,9 @@ EXPORT_SYMBOL_GPL(q6voice_cal_firmware);
  */
 int q6voice_cal_register_topologies(void)
 {
-	const char *name = q6voice_cal_firmware(Q6VOICE_CAL_TOPOLOGIES);
+	char fw_name[128];
+	const char *name = q6voice_cal_firmware(fw_name, sizeof(fw_name),
+						Q6VOICE_CAL_TOPOLOGIES, 0, 0);
 	const struct firmware *fw;
 	struct device *dev = q6voice_cal_dev;
 	dma_addr_t iova;
@@ -432,13 +453,12 @@ EXPORT_SYMBOL_GPL(q6voice_cal_register_dev_cfg);
 static int q6voice_cal_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	int ret, n;
+	const char *dir = NULL;
+	int ret;
 
-	n = of_property_read_string_array(dev->of_node, "firmware-name",
-					  q6voice_cal_names,
-					  Q6VOICE_CAL_FILE_COUNT);
-	if (n < 0 && n != -EINVAL)
-		return dev_err_probe(dev, n, "bad firmware-name\n");
+	ret = of_property_read_string(dev->of_node, "firmware-name", &dir);
+	if (ret && ret != -EINVAL)
+		return dev_err_probe(dev, ret, "bad firmware-name\n");
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
@@ -453,6 +473,7 @@ static int q6voice_cal_probe(struct platform_device *pdev)
 	if (ret && ret != -ENODEV)
 		return dev_err_probe(dev, ret, "bad calibration memory pool\n");
 
+	q6voice_cal_dir = dir;
 	q6voice_cal_dev = dev;
 	return 0;
 }
@@ -460,7 +481,7 @@ static int q6voice_cal_probe(struct platform_device *pdev)
 static void q6voice_cal_remove(struct platform_device *pdev)
 {
 	q6voice_cal_dev = NULL;
-	memset(q6voice_cal_names, 0, sizeof(q6voice_cal_names));
+	q6voice_cal_dir = NULL;
 	q6voice_cal_topologies_registered = false;
 }
 

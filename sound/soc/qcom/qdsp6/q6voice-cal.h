@@ -2,13 +2,18 @@
 #ifndef _Q6_VOICE_CAL_H
 #define _Q6_VOICE_CAL_H
 
+#include <linux/types.h>
 #include "q6cvp.h"
 
 struct device;
 struct q6voice_cal;
 struct q6voice_session;
 
-/* the order of the calibration node's firmware-name list */
+/*
+ * A call's calibration files, in the calibration node's firmware-name
+ * directory: stream.bin, topologies.bin, and per pair of ACDB devices
+ * <kind>-<tx>-<rx>.bin (devcfg, vocproc, volume; the ids as four hex digits).
+ */
 enum q6voice_cal_file {
 	Q6VOICE_CAL_STREAM,	/* the stream's own */
 	Q6VOICE_CAL_DEV_CFG,	/* what the endpoints are */
@@ -18,7 +23,12 @@ enum q6voice_cal_file {
 	Q6VOICE_CAL_FILE_COUNT,
 };
 
-const char *q6voice_cal_firmware(enum q6voice_cal_file file);
+/*
+ * The file's name in @buf, or NULL when the board has none: no directory, or
+ * a per-device file without a device pair (@tx or @rx 0).
+ */
+const char *q6voice_cal_firmware(char *buf, size_t len,
+				 enum q6voice_cal_file file, u32 tx, u32 rx);
 int q6voice_cal_register_topologies(void);
 
 /*
