@@ -940,6 +940,32 @@
 	};
 };
 
+/*
+ * The IR LED (IR_EN_SPI_MOSI, gpio102): the vendor's qupv3_se11_spi, chip select 1, at most 1 MHz. No duty-cycle
+ * here: the vendor's 30 is outside the mainline binding; the sender sets it per code (LIRC_SET_SEND_DUTY_CYCLE).
+ */
+&spi11 {
+	status = "okay";
+
+	irled@1 {
+		compatible = "ir-spi-led";
+		reg = <1>;
+
+		spi-max-frequency = <1000000>;
+	};
+};
+
+/* the vendor's qupv3_se11_spi_active drives these pins at 6 mA, no bias */
+&qup_spi11_spi {
+	drive-strength = <6>;
+	bias-disable;
+};
+
+&qup_spi11_cs {
+	drive-strength = <6>;
+	bias-disable;
+};
+
 &swr1 {
 	status = "okay";
 
