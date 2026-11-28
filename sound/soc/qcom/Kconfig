@@ -163,6 +163,8 @@ config SND_SOC_QDSP6_LSM
 	  Keyword detection on the aDSP's Listen service (SVA): one session,
 	  driven from userspace through /dev/q6lsm (open, parameters, sound
 	  model, start, detection events, stop).
+	  With it the LSM1 hostless frontend (q6lsm-dai): its PCM, opened and
+	  never read, keeps the microphone's AFE port running for the session.
 
 config SND_SOC_QDSP6_Q6VOICE_DAI
 	tristate

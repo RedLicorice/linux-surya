@@ -13,6 +13,7 @@
 #include <dt-bindings/clock/qcom,sm7150-gcc.h>
 #include <dt-bindings/clock/qcom,sm7150-videocc.h>
 #include <dt-bindings/dma/qcom-gpi.h>
+#include <dt-bindings/firmware/qcom,scm.h>
 #include <dt-bindings/interconnect/qcom,icc.h>
 #include <dt-bindings/interconnect/qcom,osm-l3.h>
 #include <dt-bindings/interconnect/qcom,sm7150-rpmh.h>
@@ -820,6 +821,19 @@
 		dfps_data_mem: dfps-data@9e300000 {
 			reg = <0x0 0x9d700000 0x0 0x0100000>;
 			no-map;
+		};
+
+		/*
+		 * The aDSP's FastRPC remote heap (the audio PD's), as the stock
+		 * DT's adsp_region: hyp-assigned to LPASS and ADSP_HEAP while the
+		 * DSP holds it (the fastrpc node's qcom,vmids).
+		 */
+		adsp_rpc_remote_heap_mem: adsp-rpc-remote-heap {
+			compatible = "shared-dma-pool";
+			alloc-ranges = <0x0 0x0 0x0 0xffffffff>;
+			reusable;
+			alignment = <0x0 0x400000>;
+			size = <0x0 0xc00000>;
 		};
 	};
 
@@ -2707,6 +2721,12 @@
 							compatible = "qcom,q6lsm-mem";
 							iommus = <&apps_smmu 0x1b21 0x0>;
 						};
+
+						/* LSM1, the hostless frontend that keeps the microphone's port running for the session */
+						q6lsmdai: dais {
+							compatible = "qcom,q6lsm-dais";
+							#sound-dai-cells = <0>;
+						};
 					};
 				};
 
@@ -2718,6 +2738,8 @@
 					label = "adsp";
 
 					qcom,non-secure-domain;
+					memory-region = <&adsp_rpc_remote_heap_mem>;
+					qcom,vmids = <QCOM_SCM_VMID_LPASS QCOM_SCM_VMID_ADSP_HEAP>;
 
 					#address-cells = <1>;
 					#size-cells = <0>;

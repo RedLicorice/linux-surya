@@ -268,6 +268,20 @@
 				sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA4>;
 			};
 		};
+
+		/*
+		 * The Listen session's microphone (PCM 9, last so the numbers
+		 * above stay): a hostless frontend. Its PCM, opened and never
+		 * read, starts the port the "LSM1 Mixer" routes, so the aDSP's
+		 * keyword detection hears the microphone with no capture to
+		 * the CPU (q6lsm-dai).
+		 */
+		lsm1-dai-link {
+			link-name = "LSM1";
+			cpu {
+				sound-dai = <&q6lsmdai>;
+			};
+		};
 	};
 
 	/*
